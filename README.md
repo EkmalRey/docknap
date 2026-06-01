@@ -245,6 +245,18 @@ docker run -d --name docknap -p 8000:8000 \
 
 See [`examples/nginx/`](examples/nginx/) for a minimal demo.
 
+## Screenshots
+
+The admin UI at `/_docknap/ui` shows registered services in a live-updating table:
+
+![Admin UI](docs/screenshots/admin-ui.png)
+
+The loading page at the proxied subdomain (while a container is booting):
+
+![Loading page](docs/screenshots/loading-page.png)
+
+To add screenshots, place PNG files in `docs/screenshots/` and reference them above.
+
 ## License
 
 MIT
