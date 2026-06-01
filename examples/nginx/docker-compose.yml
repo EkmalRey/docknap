@@ -1,0 +1,17 @@
+services:
+  nginx:
+    image: nginx:alpine
+    container_name: nginx-demo
+    labels:
+      - "docknap.enable=true"
+      - "docknap.subdomain=demo"
+      - "docknap.target_port=80"
+      - "docknap.idle_timeout=10m"
+      - "docknap.title=Demo Nginx"
+      - "docknap.theme=blue"
+    networks:
+      - docknap_network
+
+networks:
+  docknap_network:
+    external: true

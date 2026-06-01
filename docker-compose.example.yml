@@ -1,0 +1,43 @@
+version: "3.9"
+
+services:
+  docknap:
+    build: .
+    image: ghcr.io/ekmalrey/docknap:latest
+    container_name: docknap
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - DOCKNAP_LISTEN=:8000
+      - DOCKNAP_IDLE_DEFAULT=5m
+      - DOCKNAP_START_TIMEOUT=60s
+      - DOCKNAP_LOG_FORMAT=text
+      - DOCKNAP_NETWORK=docknap_network
+      - DOCKNAP_ADMIN_USER=${DOCKNAP_ADMIN_USER:-}
+      - DOCKNAP_ADMIN_PASS=${DOCKNAP_ADMIN_PASS:-}
+    networks:
+      - docknap_network
+
+  example-app:
+    image: nginx:alpine
+    container_name: example-app
+    labels:
+      - "docknap.enable=true"
+      - "docknap.subdomain=demo"
+      - "docknap.target_port=80"
+      - "docknap.idle_timeout=10m"
+      - "docknap.startup_timeout=60s"
+      - "docknap.title=Demo App"
+      - "docknap.subtitle=powered by docknap"
+      - "docknap.icon=◐"
+      - "docknap.theme=green"
+      - "docknap.show_logs=true"
+      - "docknap.show_stats=true"
+    networks:
+      - docknap_network
+
+networks:
+  docknap_network:
+    name: docknap_network
+    driver: bridge

@@ -1,0 +1,15 @@
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Go build artifacts
+/docknap
+/docknap-test
+*.exe
+*.test
+*.out
+coverage.txt
