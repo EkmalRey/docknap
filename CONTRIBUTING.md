@@ -70,7 +70,7 @@ Maintainers tag releases with `vX.Y.Z` (semver). Pushing the tag triggers the re
 
 1. Runs `go vet` and `go test`
 2. Builds multi-arch images (linux/amd64, linux/arm64)
-3. Pushes to `ghcr.io/EkmalRey/docknap:X.Y.Z` and `:latest`
+3. Pushes to `ghcr.io/ekmalrey/docknap:X.Y.Z` and `:latest` (lowercase per GHCR / Go module rules)
 4. Creates a GitHub release with auto-generated notes
 
 If you're a maintainer, ensure the CHANGELOG is updated before tagging.

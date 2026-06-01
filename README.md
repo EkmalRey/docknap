@@ -152,18 +152,18 @@ If `DOCKNAP_ADMIN_HOST=docknap.internal` is set, the same host also serves the a
 While a container is booting, docknap serves a self-contained HTML page that:
 
 - Polls `/_docknap/wait/<subdomain>` every second (no full-page refresh)
-- Shows a progress bar, elapsed time, and live boot log
+- Shows a progress bar, elapsed time, and a stylized boot sequence
 - Auto-reloads once the service is ready
 - Shows a "startup timed out" panel with a Retry button if the timeout is hit
 
-The page does not expose container names, ports, hostnames, or any internal state.
+The boot log is a fixed set of staged messages (purely cosmetic), not a live tail of the container's stdout. The page does not expose container names, ports, hostnames, or any internal state.
 
 ## Endpoints
 
 | Endpoint | Description |
 |----------|-------------|
 | `GET /` | Proxy (used by reverse proxy) |
-| `GET /_docknap` / `GET /_docknap/ui` | Admin UI (HTML) |
+| `GET /_docknap`, `GET /_docknap/`, `GET /_docknap/ui` | Admin UI (HTML) |
 | `GET /_docknap/status` | JSON list of registered services and their state |
 | `GET /_docknap/wake/<subdomain>` | Manually wake a service without proxying |
 | `POST /_docknap/stop/<subdomain>` | Manually stop a service |
@@ -171,6 +171,8 @@ The page does not expose container names, ports, hostnames, or any internal stat
 | `GET /_docknap/metrics` | Prometheus metrics for all services (text format) |
 | `GET /_docknap/metrics/<subdomain>` | Prometheus metrics filtered to one service |
 | `GET /_docknap/history/<subdomain>` | JSON with current state, event counts, and last 100 events |
+
+If `DOCKNAP_ADMIN_HOST` is set, the admin UI is also served at the root of that host (e.g. `https://docknap.internal/`). On other hostnames, the root path is the normal proxy.
 
 The admin UI shows a live table of all registered services with state, uptime, and Wake/Stop buttons. It auto-refreshes every 2 seconds.
 
@@ -199,6 +201,20 @@ environment:
 When enabled, all `/_docknap/*` endpoints require auth **except `/_docknap/wait/`** (the loading page polls it from the browser). Browsers will prompt for credentials. Failed attempts increment `docknap_admin_auth_failures_total`.
 
 Passwords are stored as SHA-256 hashes in memory and compared with constant-time equality.
+
+> **Security:** HTTP Basic Auth sends credentials base64-encoded, not encrypted. **Always run docknap behind a TLS-terminating reverse proxy.** docknap will log a warning at startup if no admin credentials are configured.
+
+## Security
+
+docknap has full read+write access to the Docker socket (it starts and stops containers). Anyone who can reach the docknap port effectively has root-equivalent control over the Docker host. Treat the port as equivalent to shell access.
+
+Recommendations:
+
+- Always run docknap behind a TLS-terminating reverse proxy (Caddy, nginx, Traefik).
+- Set `DOCKNAP_ADMIN_USER` and `DOCKNAP_ADMIN_PASS` if the port is exposed beyond localhost. docknap will emit a warning at startup if these are unset.
+- Bind docknap's port to a trusted network only (e.g. a private Docker network, not `0.0.0.0` on a public host).
+- Use a dedicated, low-privilege user account for the Docker socket where the engine supports it.
+- Rotate `DOCKNAP_ADMIN_PASS` periodically. Generate with `openssl rand -hex 24`.
 
 ## Logging
 

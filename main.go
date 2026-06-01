@@ -12,12 +12,15 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/client"
 )
 
@@ -53,6 +56,7 @@ type Docknap struct {
 	bootStarts  map[string]time.Time
 	startedAt   map[string]time.Time
 	events      map[string][]Event
+	startLocks  map[string]*sync.Mutex
 	mu          sync.RWMutex
 	listenAddr  string
 	idleDefault time.Duration
@@ -71,6 +75,8 @@ type Docknap struct {
 	adminUserHash  []byte
 	adminPassHash  []byte
 	adminHost      string
+	rootCtx       context.Context
+	rootCancel    context.CancelFunc
 }
 
 func main() {
@@ -111,6 +117,7 @@ func main() {
 		bootStarts:  make(map[string]time.Time),
 		startedAt:   make(map[string]time.Time),
 		events:      make(map[string][]Event),
+		startLocks:  make(map[string]*sync.Mutex),
 		listenAddr:  envOr("DOCKNAP_LISTEN", ":8000"),
 		idleDefault: parseDurationOr("DOCKNAP_IDLE_DEFAULT", 5*time.Minute),
 		logger:      logger,
@@ -135,15 +142,20 @@ func main() {
 		s.adminUserHash = userSum[:]
 		s.adminPassHash = s.hashPassword(adminPass)
 		logger.Info("admin auth enabled", F("user", adminUser))
+	} else {
+		logger.Warn("admin auth is DISABLED",
+			F("reason", "DOCKNAP_ADMIN_USER / DOCKNAP_ADMIN_PASS not set"),
+			F("risk", "anyone who reaches the admin port can start/stop any container on this Docker host"),
+			F("mitigation", "set DOCKNAP_ADMIN_USER and DOCKNAP_ADMIN_PASS, and put docknap behind TLS"))
 	}
 
-	ctx := context.Background()
-	if err := s.discover(ctx); err != nil {
+	s.rootCtx, s.rootCancel = context.WithCancel(context.Background())
+	if err := s.discover(s.rootCtx); err != nil {
 		log.Fatalf("discover: %v", err)
 	}
 	mRegistered.Set(nil, float64(len(s.configs)))
 
-	go s.watch(ctx)
+	go s.watch(s.rootCtx)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/_docknap", s.requireAuth(s.handleAdmin))
@@ -169,7 +181,33 @@ func main() {
 		WriteTimeout: 0,
 		IdleTimeout:  120 * time.Second,
 	}
-	log.Fatal(srv.ListenAndServe())
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	serverErr := make(chan error, 1)
+	go func() { serverErr <- srv.ListenAndServe() }()
+
+	select {
+	case err := <-serverErr:
+		if err != nil && err != http.ErrServerClosed {
+			log.Fatalf("server: %v", err)
+		}
+	case sig := <-sigCh:
+		logger.Info("shutdown signal received", F("signal", sig.String()))
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("server shutdown", F("err", err.Error()))
+		}
+		s.rootCancel()
+		for _, cfg := range s.configs {
+			if t, ok := s.idleTimers[cfg.Container]; ok {
+				t.Stop()
+			}
+		}
+		logger.Info("shutdown complete")
+	}
 }
 
 func (s *Docknap) recordEvent(sub, eventType, message string, fields map[string]interface{}) {
@@ -200,8 +238,16 @@ func parseDurationOr(key string, fallback time.Duration) time.Duration {
 	return fallback
 }
 
+func (s *Docknap) listOpts() container.ListOptions {
+	networkName := envOr("DOCKNAP_NETWORK", "docknap_network")
+	return container.ListOptions{
+		All:     true,
+		Filters: filters.NewArgs(filters.Arg("network", networkName)),
+	}
+}
+
 func (s *Docknap) discover(ctx context.Context) error {
-	containers, err := s.cli.ContainerList(ctx, container.ListOptions{All: true})
+	containers, err := s.cli.ContainerList(ctx, s.listOpts())
 	if err != nil {
 		return err
 	}
@@ -228,8 +274,13 @@ func (s *Docknap) discover(ctx context.Context) error {
 func (s *Docknap) watch(ctx context.Context) {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
-	for range ticker.C {
-		containers, err := s.cli.ContainerList(ctx, container.ListOptions{All: true})
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		containers, err := s.cli.ContainerList(ctx, s.listOpts())
 		if err != nil {
 			s.logger.Warn("watch list failed", F("err", err.Error()))
 			continue
@@ -261,6 +312,7 @@ func (s *Docknap) watch(ctx context.Context) {
 				}
 				delete(s.bootStarts, cfg.Subdomain)
 				delete(s.startedAt, cfg.Subdomain)
+				delete(s.startLocks, name)
 				s.recordEvent(cfg.Subdomain, "disappeared", "container no longer present in registry", nil)
 			}
 		}
@@ -583,6 +635,7 @@ func (s *statusRecorder) WriteHeader(code int) {
 
 func (s *statusRecorder) Write(b []byte) (int, error) {
 	if !s.wroteHeader {
+		s.status = http.StatusOK
 		s.wroteHeader = true
 	}
 	return s.ResponseWriter.Write(b)
@@ -894,6 +947,16 @@ setTimeout(poll, 300);
 </html>`
 
 func (s *Docknap) startContainer(ctx context.Context, cfg *Config) error {
+	s.mu.Lock()
+	lock, ok := s.startLocks[cfg.Container]
+	if !ok {
+		lock = &sync.Mutex{}
+		s.startLocks[cfg.Container] = lock
+	}
+	s.mu.Unlock()
+	lock.Lock()
+	defer lock.Unlock()
+
 	info, err := s.cli.ContainerInspect(ctx, cfg.Container)
 	if err != nil {
 		return fmt.Errorf("inspect: %w", err)
@@ -951,6 +1014,11 @@ func (s *Docknap) startContainer(ctx context.Context, cfg *Config) error {
 
 func extractSubdomain(host string) string {
 	host = strings.Split(host, ":")[0]
+	host = strings.TrimPrefix(host, "[")
+	host = strings.TrimSuffix(host, "]")
+	if host == "" || net.ParseIP(host) != nil {
+		return ""
+	}
 	parts := strings.Split(host, ".")
 	if len(parts) < 2 {
 		return ""
@@ -1024,8 +1092,10 @@ func (s *Docknap) stopContainerWithReason(cfg *Config, reason string) {
 	delete(s.idleTimers, cfg.Container)
 	s.mu.Unlock()
 
+	stopCtx, cancel := context.WithTimeout(s.rootCtx, 35*time.Second)
+	defer cancel()
 	timeout := 30
-	if err := s.cli.ContainerStop(context.Background(), cfg.Container, container.StopOptions{Timeout: &timeout}); err != nil {
+	if err := s.cli.ContainerStop(stopCtx, cfg.Container, container.StopOptions{Timeout: &timeout}); err != nil {
 		s.logger.Warn("container stop failed", F("subdomain", cfg.Subdomain), F("container", cfg.Container), F("err", err.Error()))
 		s.recordEvent(cfg.Subdomain, "stop_error", err.Error(), map[string]interface{}{"reason": reason})
 		return

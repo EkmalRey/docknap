@@ -6,6 +6,11 @@ services:
     image: ghcr.io/ekmalrey/docknap:latest
     container_name: docknap
     restart: unless-stopped
+    # docknap needs read+write access to the Docker socket to start and stop
+    # managed containers. Anyone who can reach docknap's port (8000) effectively
+    # has full container management on this host. Always put docknap behind a
+    # reverse proxy with TLS, and set DOCKNAP_ADMIN_USER / DOCKNAP_ADMIN_PASS
+    # if you expose it beyond localhost.
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
@@ -14,8 +19,13 @@ services:
       - DOCKNAP_START_TIMEOUT=60s
       - DOCKNAP_LOG_FORMAT=text
       - DOCKNAP_NETWORK=docknap_network
+      - DOCKNAP_ADMIN_HOST=${DOCKNAP_ADMIN_HOST:-}
       - DOCKNAP_ADMIN_USER=${DOCKNAP_ADMIN_USER:-}
       - DOCKNAP_ADMIN_PASS=${DOCKNAP_ADMIN_PASS:-}
+    # Defaults are sized for a homelab single-host setup. Tighten for shared hosts.
+    mem_limit: 128m
+    cpus: 0.5
+    pids_limit: 256
     networks:
       - docknap_network
 
@@ -41,3 +51,13 @@ networks:
   docknap_network:
     name: docknap_network
     driver: bridge
+
+# Security notes
+# --------------
+# 1. Put docknap behind a TLS-terminating reverse proxy (Caddy, nginx, Traefik).
+#    HTTP Basic Auth sends credentials base64-encoded, NOT encrypted.
+# 2. Set DOCKNAP_ADMIN_USER and DOCKNAP_ADMIN_PASS in a .env file. NEVER commit
+#    the .env file to git. Use a strong random password (e.g. `openssl rand -hex 24`).
+# 3. The Docker socket mount gives docknap root-equivalent control over the host.
+#    Treat the docknap port as equivalent to shell access on this host.
+
