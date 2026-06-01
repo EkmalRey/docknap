@@ -5,6 +5,17 @@ All notable changes to docknap will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] - 2026-06-01
+
+### Fixed
+- `discover()` and `watch()` now arm an idle timer for containers that are already running at the time docknap notices them. Previously, if a container was running when docknap started (or when the watch loop first saw it), the container was tracked in `startedAt` but no idle timer was ever set up — the container would never stop on idle. Found in the wild: openwebui and glance running for 16+ minutes past their 10-minute idle timeout. New helper `armIdleTimer()` sets the timer only if none exists (idempotent). `resetIdleTimer()` (used by the proxy hot path) is unchanged.
+
+### Changed
+- `http.Server` now sets `ReadHeaderTimeout: 10s` and `MaxHeaderBytes: 1 MiB` to mitigate slowloris / oversized-header DoS. `WriteTimeout: 0` is preserved for streaming proxy responses.
+
+### Tests
+- `TestArmIdleTimerCreatesTimer` and `TestArmIdleTimerIsIdempotent` in `armIdleTimer_test.go`.
+
 ## [0.1.2] - 2026-06-01
 
 ### Fixed

@@ -175,11 +175,13 @@ func main() {
 	}
 
 	srv := &http.Server{
-		Addr:         s.listenAddr,
-		Handler:      mux,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 0,
-		IdleTimeout:  120 * time.Second,
+		Addr:              s.listenAddr,
+		Handler:           mux,
+		ReadTimeout:       30 * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
+		WriteTimeout:      0,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 
 	sigCh := make(chan os.Signal, 1)
@@ -264,7 +266,10 @@ func (s *Docknap) discover(ctx context.Context) error {
 		info, err := s.cli.ContainerInspect(ctx, name)
 		if err == nil && info.State.Running && info.State.StartedAt != "" {
 			if t, err := time.Parse(time.RFC3339Nano, info.State.StartedAt); err == nil {
+				s.mu.Lock()
 				s.startedAt[cfg.Subdomain] = t
+				s.mu.Unlock()
+				s.armIdleTimer(cfg)
 			}
 		}
 	}
@@ -301,6 +306,7 @@ func (s *Docknap) watch(ctx context.Context) {
 			}
 		}
 
+		var toArm []*Config
 		s.mu.Lock()
 		for name, cfg := range known {
 			if !found[name] {
@@ -323,13 +329,27 @@ func (s *Docknap) watch(ctx context.Context) {
 				continue
 			}
 			name := strings.TrimPrefix(c.Names[0], "/")
+			isNew := false
 			if existing, exists := s.configs[cfg.Subdomain]; !exists || existing.Container != name {
 				cfg.Container = name
 				s.configs[cfg.Subdomain] = cfg
 				s.logger.Info("registered", F("subdomain", cfg.Subdomain), F("container", name))
+				isNew = true
+			}
+			if isNew && c.State == "running" {
+				info, err := s.cli.ContainerInspect(ctx, name)
+				if err == nil && info.State.StartedAt != "" {
+					if t, err := time.Parse(time.RFC3339Nano, info.State.StartedAt); err == nil {
+						s.startedAt[cfg.Subdomain] = t
+					}
+				}
+				toArm = append(toArm, cfg)
 			}
 		}
 		s.mu.Unlock()
+		for _, cfg := range toArm {
+			s.armIdleTimer(cfg)
+		}
 		s.mRegistered.Set(nil, float64(len(s.configs)))
 	}
 }
@@ -1086,6 +1106,20 @@ func (s *Docknap) resetIdleTimer(cfg *Config) {
 	s.idleTimers[cfg.Container] = time.AfterFunc(cfg.IdleTimeout, func() {
 		s.mIdleStop.Add(map[string]string{"subdomain": cfg.Subdomain}, 1)
 		s.recordEvent(cfg.Subdomain, "idle_stop", "idle timeout reached", map[string]interface{}{"idle": cfg.IdleTimeout.String()})
+		s.logger.Info("idle timeout, stopping", F("subdomain", cfg.Subdomain), F("container", cfg.Container), F("idle", cfg.IdleTimeout.String()))
+		s.stopContainerWithReason(cfg, "idle")
+	})
+}
+
+func (s *Docknap) armIdleTimer(cfg *Config) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.idleTimers[cfg.Container]; ok {
+		return
+	}
+	s.idleTimers[cfg.Container] = time.AfterFunc(cfg.IdleTimeout, func() {
+		s.mIdleStop.Add(map[string]string{"subdomain": cfg.Subdomain}, 1)
+		s.recordEvent(cfg.Subdomain, "idle_stop", "idle timeout reached", map[string]interface{}{"idle": cfg.IdleTimeout.String(), "source": "discover/watch"})
 		s.logger.Info("idle timeout, stopping", F("subdomain", cfg.Subdomain), F("container", cfg.Container), F("idle", cfg.IdleTimeout.String()))
 		s.stopContainerWithReason(cfg, "idle")
 	})
