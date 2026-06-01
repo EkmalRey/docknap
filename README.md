@@ -65,6 +65,7 @@ Add labels to any container you want to be lazy-loaded, attach it to `docknap_ne
 | `DOCKNAP_START_TIMEOUT` | `60s` | Default startup timeout (overridden by `docknap.startup_timeout` label) |
 | `DOCKNAP_NETWORK` | `docknap_network` | Docker network used to resolve container IPs |
 | `DOCKNAP_LOG_FORMAT` | `text` | `text` or `json` |
+| `DOCKNAP_ADMIN_HOST` | (unset) | If set, the admin UI is served at the root of this hostname (e.g. `https://docknap.internal/`). Other hostnames are unaffected. |
 | `DOCKNAP_ADMIN_USER` | (unset) | If set with `DOCKNAP_ADMIN_PASS`, requires HTTP Basic Auth for all `/_docknap/*` endpoints except `/_docknap/wait/` (used by the loading page) |
 | `DOCKNAP_ADMIN_PASS` | (unset) | Password for admin auth (must be set with `DOCKNAP_ADMIN_USER`) |
 
@@ -126,14 +127,25 @@ docknap needs read+write access to the Docker socket (it starts and stops contai
 Point a reverse proxy (e.g. Caddy) at docknap, preserving the `Host` header:
 
 ```caddy
-*.internal {
-    reverse_proxy docknap:8000 {
-        header_up Host {host}
+docknap.internal *.internal {
+    tls internal
+
+    @adguard host adguard.internal
+    handle @adguard {
+        reverse_proxy host.docker.internal:3080
+    }
+
+    handle {
+        reverse_proxy docknap:8000 {
+            header_up Host {host}
+        }
     }
 }
 ```
 
 docknap reads the subdomain from `Host: myapp.internal` and looks up `myapp` in its registry.
+
+If `DOCKNAP_ADMIN_HOST=docknap.internal` is set, the same host also serves the admin UI at the root (`https://docknap.internal/`) — so you can bookmark it as the dashboard entry point. Add the host to your Caddy site block to cover it with the same wildcard cert.
 
 ## Loading page
 

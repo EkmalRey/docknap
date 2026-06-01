@@ -70,6 +70,7 @@ type Docknap struct {
 	adminUser      string
 	adminUserHash  []byte
 	adminPassHash  []byte
+	adminHost      string
 }
 
 func main() {
@@ -124,6 +125,10 @@ func main() {
 		mProxyDur:   mProxyDur,
 		mRegistered: mRegistered,
 		adminUser:   adminUser,
+		adminHost:   os.Getenv("DOCKNAP_ADMIN_HOST"),
+	}
+	if s.adminHost != "" {
+		logger.Info("admin host", F("host", s.adminHost))
 	}
 	if adminUser != "" {
 		userSum := sha256.Sum256([]byte(adminUser))
@@ -493,6 +498,16 @@ func (s *Docknap) refreshStateGauges(ctx context.Context) {
 }
 
 func (s *Docknap) handleProxy(w http.ResponseWriter, r *http.Request) {
+	if s.adminHost != "" {
+		hostNoPort := strings.Split(r.Host, ":")[0]
+		if hostNoPort == s.adminHost {
+			r2 := r.Clone(r.Context())
+			r2.URL.Path = "/_docknap/ui"
+			s.requireAuth(s.handleAdmin)(w, r2)
+			return
+		}
+	}
+
 	sub := extractSubdomain(r.Host)
 	if sub == "" {
 		http.Error(w, "no subdomain in host", http.StatusBadRequest)
