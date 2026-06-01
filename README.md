@@ -1,10 +1,18 @@
 # docknap
 
-A lazy-loading reverse proxy for Docker containers. Put it in front of your rarely-used services and they stay off until someone actually requests them.
+**A lazy-loading reverse proxy for Docker containers.** Put it in front of your rarely-used services and they stay off until someone actually requests them.
 
 [![build](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/ekmalrey/docknap/actions)
+[![release](https://img.shields.io/github/v/release/ekmalrey/docknap)](https://github.com/ekmalrey/docknap/releases)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![image](https://img.shields.io/badge/image-ghcr.io%2Fekmalrey%2Fdocknap-blue)](https://github.com/ekmalrey/docknap/pkgs/container/docknap)
+
+<table>
+<tr>
+<td width="50%"><b>Admin UI</b> &mdash; live status, wake, stop<br><img src="docs/screenshots/admin-ui.png" alt="Admin UI"></td>
+<td width="50%"><b>Loading page</b> &mdash; shown while a container boots<br><img src="docs/screenshots/loading-page.png" alt="Loading page"></td>
+</tr>
+</table>
 
 ## How it works
 
@@ -247,15 +255,7 @@ See [`examples/nginx/`](examples/nginx/) for a minimal demo.
 
 ## Screenshots
 
-The admin UI at `/_docknap/ui` shows registered services in a live-updating table:
-
-![Admin UI](docs/screenshots/admin-ui.png)
-
-The loading page at the proxied subdomain (while a container is booting):
-
-![Loading page](docs/screenshots/loading-page.png)
-
-To add screenshots, place PNG files in `docs/screenshots/` and reference them above.
+See the screenshots at the top of this README.
 
 ## License
 
