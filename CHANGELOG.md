@@ -5,6 +5,11 @@ All notable changes to docknap will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-06-01
+
+### Fixed
+- `handleWait` now reports a sensible `elapsed` when the container was already running before the first poll. Previously, if the inner start-goroutine had cleared `bootStarts[sub]` (port opened fast), `elapsed` was computed from the zero `time.Time`, producing a value of "thousands of years" in the JSON response. Now falls back to `startedAt[sub]` when `bootStarts[sub]` is missing. The `timed_out` flag was unaffected (already gated on `!portOpen`).
+
 ## [0.1.1] - 2026-06-01
 
 ### Added

@@ -748,8 +748,16 @@ func (s *Docknap) handleWait(w http.ResponseWriter, r *http.Request) {
 
 	s.mu.RLock()
 	bootStart := s.bootStarts[sub]
+	startedAt := s.startedAt[sub]
 	s.mu.RUnlock()
-	elapsed := time.Since(bootStart)
+
+	var elapsed time.Duration
+	switch {
+	case !bootStart.IsZero():
+		elapsed = time.Since(bootStart)
+	case !startedAt.IsZero():
+		elapsed = time.Since(startedAt)
+	}
 	timedOut := !portOpen && elapsed > cfg.StartupTimeout
 
 	if timedOut {

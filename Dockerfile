@@ -6,7 +6,7 @@ COPY go.mod go.sum* ./
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
-    go build -ldflags="-s -w -X main.version=0.1.1" -o /out/docknap .
+    go build -ldflags="-s -w -X main.version=0.1.2" -o /out/docknap .
 
 FROM alpine:3.22
 RUN apk add --no-cache ca-certificates tzdata wget
