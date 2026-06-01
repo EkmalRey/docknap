@@ -7,12 +7,11 @@
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![image](https://img.shields.io/badge/image-ghcr.io%2Fekmalrey%2Fdocknap-blue)](https://github.com/ekmalrey/docknap/pkgs/container/docknap)
 
-<table>
-<tr>
-<td width="50%"><b>Admin UI</b> &mdash; live status, wake, stop<br><img src="docs/screenshots/admin-ui.png" alt="Admin UI"></td>
-<td width="50%"><b>Loading page</b> &mdash; shown while a container boots<br><img src="docs/screenshots/loading-page.png" alt="Loading page"></td>
-</tr>
-</table>
+**Admin UI** &mdash; live status, wake, stop
+![Admin UI](docs/screenshots/admin-ui.png)
+
+**Loading page** &mdash; shown while a container boots
+![Loading page](docs/screenshots/loading-page.png)
 
 ## How it works
 
