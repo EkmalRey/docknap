@@ -5,6 +5,14 @@ All notable changes to docknap will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.4] - 2026-06-02
+
+### Fixed
+- `/_docknap/status` now returns services in stable alphabetical order by subdomain. Previously Go's randomized map iteration produced a different ordering on every call, which made the admin UI rows jump around on each 2s refresh.
+
+### Changed
+- Admin UI auto-refresh interval: 2s → 5s. Status changes (start/stop/idle-timeout) are infrequent in a homelab; 5s halves the polling load without losing visibility.
+
 ## [0.1.3] - 2026-06-01
 
 ### Fixed

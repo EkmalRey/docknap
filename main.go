@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -414,9 +415,16 @@ func (s *Docknap) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.RUnlock()
 
+	subs := make([]string, 0, len(snapshot))
+	for sub := range snapshot {
+		subs = append(subs, sub)
+	}
+	sort.Strings(subs)
+
 	services := make([]map[string]interface{}, 0, len(snapshot))
 	running := 0
-	for sub, cfg := range snapshot {
+	for _, sub := range subs {
+		cfg := snapshot[sub]
 		info, err := s.cli.ContainerInspect(r.Context(), cfg.Container)
 		state := "unknown"
 		if err == nil {

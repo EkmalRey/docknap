@@ -172,7 +172,7 @@ document.addEventListener('click', async (e) => {
 });
 
 refresh();
-setInterval(refresh, 2000);
+setInterval(refresh, 5000);
 </script>
 </body>
 </html>`
