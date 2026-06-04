@@ -48,6 +48,23 @@ const adminPage = `<!doctype html>
   .btn:disabled { opacity: 0.4; cursor: not-allowed; }
   .btn:disabled:hover { border-color: var(--btn); color: var(--fg); }
   .actions { white-space: nowrap; }
+  .logout-form { display: inline-block; margin: 0; padding: 0; }
+  .logout-btn {
+    display: inline-block;
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--dim);
+    padding: 0.3rem 0.7rem;
+    font: inherit;
+    font-size: 0.72rem;
+    cursor: pointer;
+    border-radius: 2px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    transition: border-color 0.15s, color 0.15s;
+  }
+  .logout-btn:hover { border-color: var(--err); color: var(--err); }
+  .logout-btn:focus-visible { outline: 2px solid var(--err); outline-offset: 2px; }
   .empty { text-align: center; color: var(--dim); padding: 3rem 1rem; }
   .empty .icon { font-size: 2rem; color: var(--dim); margin-bottom: 0.5rem; }
   .toast { position: fixed; bottom: 1.5rem; right: 1.5rem; background: var(--bg); border: 1px solid var(--border); padding: 0.6rem 1rem; font-size: 0.78rem; opacity: 0; transition: opacity 0.3s; pointer-events: none; z-index: 200; }
@@ -69,6 +86,9 @@ const adminPage = `<!doctype html>
     <div>registered <b id="stat-reg">0</b></div>
     <div>running <b id="stat-run">0</b></div>
     <div>refresh <b id="stat-refresh">2s</b></div>
+    <form class="logout-form" method="POST" action="/_docknap/auth/logout">
+      <button class="logout-btn" type="submit" title="clear session cookie">logout</button>
+    </form>
   </div>
 </header>
 <table>

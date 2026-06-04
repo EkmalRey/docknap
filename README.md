@@ -164,6 +164,9 @@ The boot log is a fixed set of staged messages (purely cosmetic), not a live tai
 |----------|-------------|
 | `GET /` | Proxy (used by reverse proxy) |
 | `GET /_docknap`, `GET /_docknap/`, `GET /_docknap/ui` | Admin UI (HTML) |
+| `GET /_docknap/auth/login` | Themed login form (no auth required) |
+| `POST /_docknap/auth/login` | Submit credentials; sets `docknap_auth` cookie and redirects to `next` (or `/_docknap/`) |
+| `POST /_docknap/auth/logout` | Clear the session cookie and redirect to the login page |
 | `GET /_docknap/status` | JSON list of registered services and their state |
 | `GET /_docknap/wake/<subdomain>` | Manually wake a service without proxying |
 | `POST /_docknap/stop/<subdomain>` | Manually stop a service |
@@ -198,11 +201,11 @@ environment:
   - DOCKNAP_ADMIN_PASS=your-secret-here
 ```
 
-When enabled, all `/_docknap/*` endpoints require auth **except `/_docknap/wait/`** (the loading page polls it from the browser). Browsers will prompt for credentials. Failed attempts increment `docknap_admin_auth_failures_total`.
+When enabled, all `/_docknap/*` endpoints require auth **except `/_docknap/wait/`** (the loading page polls it from the browser). docknap serves a themed in-app login page at `/_docknap/auth/login` instead of triggering the browser's native `Authentication Required` dialog. Successful logins set a `docknap_auth` session cookie (`HttpOnly`, `SameSite=Lax`, 12h) that authenticates subsequent requests; the admin header has a `logout` button to clear it. Scripts and curl with `-u user:pass` still work via the standard `Authorization: Basic` header. Failed attempts increment `docknap_admin_auth_failures_total`.
 
 Passwords are stored as SHA-256 hashes in memory and compared with constant-time equality.
 
-> **Security:** HTTP Basic Auth sends credentials base64-encoded, not encrypted. **Always run docknap behind a TLS-terminating reverse proxy.** docknap will log a warning at startup if no admin credentials are configured.
+> **Security:** HTTP Basic Auth and the login-cookie flow both send credentials base64-encoded over the wire, not encrypted. **Always run docknap behind a TLS-terminating reverse proxy.** docknap will log a warning at startup if no admin credentials are configured.
 
 ## Security
 

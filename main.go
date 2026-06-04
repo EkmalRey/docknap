@@ -159,6 +159,8 @@ func main() {
 	go s.watch(s.rootCtx)
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/_docknap/auth/login", s.handleLogin)
+	mux.HandleFunc("/_docknap/auth/logout", s.handleLogout)
 	mux.HandleFunc("/_docknap", s.requireAuth(s.handleAdmin))
 	mux.HandleFunc("/_docknap/", s.requireAuth(s.handleAdmin))
 	mux.HandleFunc("/_docknap/status", s.requireAuth(s.handleStatus))
@@ -168,6 +170,7 @@ func main() {
 	mux.HandleFunc("/_docknap/metrics", s.requireAuth(s.handleMetrics))
 	mux.HandleFunc("/_docknap/metrics/", s.requireAuth(s.handleServiceMetrics))
 	mux.HandleFunc("/_docknap/history/", s.requireAuth(s.handleServiceHistory))
+	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/", s.handleProxy)
 
 	logger.Info("listening", F("addr", s.listenAddr), F("registered", len(s.configs)))
@@ -401,6 +404,12 @@ func (s *Docknap) parseLabels(labels map[string]string) (*Config, bool) {
 		ShowLogs:       showLogs,
 		ShowStats:      showStats,
 	}, true
+}
+
+func (s *Docknap) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ok"))
 }
 
 func (s *Docknap) handleStatus(w http.ResponseWriter, r *http.Request) {

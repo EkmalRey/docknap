@@ -1,0 +1,419 @@
+package main
+
+import (
+	"crypto/sha256"
+	"encoding/base64"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+func newAuthTestDocknap(t *testing.T) *Docknap {
+	t.Helper()
+	s := &Docknap{
+		adminUser:  "admin",
+		configs:    make(map[string]*Config),
+		idleTimers: make(map[string]*time.Timer),
+		bootStarts: make(map[string]time.Time),
+		startedAt:  make(map[string]time.Time),
+		events:     make(map[string][]Event),
+		startLocks: make(map[string]*sync.Mutex),
+		logger:     NewLogger(io.Discard, false),
+	}
+	userSum := sha256.Sum256([]byte("admin"))
+	s.adminUserHash = userSum[:]
+	s.adminPassHash = s.hashPassword("s3cret")
+	return s
+}
+
+func TestParseBasicAuth(t *testing.T) {
+	cases := []struct {
+		name    string
+		header  string
+		wantU   string
+		wantP   string
+		wantOK  bool
+	}{
+		{"valid", "Basic " + base64.StdEncoding.EncodeToString([]byte("admin:secret")), "admin", "secret", true},
+		{"empty password", "Basic " + base64.StdEncoding.EncodeToString([]byte("admin:")), "admin", "", true},
+		{"missing prefix", "Bearer foo", "", "", false},
+		{"empty header", "", "", "", false},
+		{"invalid base64", "Basic !!!notbase64!!!", "", "", false},
+		{"no colon", "Basic " + base64.StdEncoding.EncodeToString([]byte("nocolon")), "", "", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			u, p, ok := parseBasicAuth(c.header)
+			if ok != c.wantOK || u != c.wantU || p != c.wantP {
+				t.Errorf("parseBasicAuth(%q) = (%q, %q, %v), want (%q, %q, %v)",
+					c.header, u, p, ok, c.wantU, c.wantP, c.wantOK)
+			}
+		})
+	}
+}
+
+func TestSafeRedirect(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"", "/default"},
+		{"/_docknap/", "/_docknap/"},
+		{"/_docknap/status", "/_docknap/status"},
+		{"//evil.com", "/default"},
+		{"/\\evil.com", "/default"},
+		{"https://evil.com", "/default"},
+		{"javascript:alert(1)", "/default"},
+		{"/ok?x=1#y", "/ok?x=1#y"},
+	}
+	for _, c := range cases {
+		if got := safeRedirect(c.in, "/default"); got != c.want {
+			t.Errorf("safeRedirect(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestHtmlEscape(t *testing.T) {
+	in := `<a href="x">&'"\u2028`
+	want := `&lt;a href=&quot;x&quot;&gt;&amp;&#39;`
+	got := htmlEscape(in)
+	if !strings.HasPrefix(got, want) {
+		t.Errorf("htmlEscape(%q) = %q, want prefix %q", in, got, want)
+	}
+}
+
+func TestLoginErrorBlock(t *testing.T) {
+	if got := loginErrorBlock(""); got != "" {
+		t.Errorf("empty err should produce empty block, got %q", got)
+	}
+	if got := loginErrorBlock("invalid credentials"); !strings.Contains(got, "invalid credentials") {
+		t.Errorf("expected error text in block, got %q", got)
+	}
+	if got := loginErrorBlock(`<script>`); strings.Contains(got, "<script>") {
+		t.Errorf("error block should escape HTML, got %q", got)
+	}
+}
+
+func TestVerifyCredentials(t *testing.T) {
+	s := newAuthTestDocknap(t)
+	if !s.verifyCredentials("admin", "s3cret") {
+		t.Error("valid credentials should pass")
+	}
+	if s.verifyCredentials("admin", "wrong") {
+		t.Error("wrong password should fail")
+	}
+	if s.verifyCredentials("root", "s3cret") {
+		t.Error("wrong user should fail")
+	}
+}
+
+func TestCheckRequestAuth(t *testing.T) {
+	s := newAuthTestDocknap(t)
+	mkReq := func(auth, cookie string) *http.Request {
+		r := httptest.NewRequest("GET", "/_docknap/", nil)
+		if auth != "" {
+			r.Header.Set("Authorization", auth)
+		}
+		if cookie != "" {
+			r.AddCookie(&http.Cookie{Name: authCookieName, Value: cookie})
+		}
+		return r
+	}
+	goodAuth := "Basic " + base64.StdEncoding.EncodeToString([]byte("admin:s3cret"))
+	badAuth := "Basic " + base64.StdEncoding.EncodeToString([]byte("admin:wrong"))
+	goodCookie := base64.StdEncoding.EncodeToString([]byte("admin:s3cret"))
+	badCookie := base64.StdEncoding.EncodeToString([]byte("admin:wrong"))
+
+	if !s.checkRequestAuth(mkReq(goodAuth, "")) {
+		t.Error("valid Authorization header should pass")
+	}
+	if !s.checkRequestAuth(mkReq("", goodCookie)) {
+		t.Error("valid cookie should pass")
+	}
+	if s.checkRequestAuth(mkReq("", "")) {
+		t.Error("empty request should fail")
+	}
+	if s.checkRequestAuth(mkReq(badAuth, "")) {
+		t.Error("bad Authorization should fail")
+	}
+	if s.checkRequestAuth(mkReq("", badCookie)) {
+		t.Error("bad cookie should fail")
+	}
+	if !s.checkRequestAuth(mkReq(goodAuth, badCookie)) {
+		t.Error("good header alone should be enough even with a bad cookie")
+	}
+	if s.checkRequestAuth(mkReq(badAuth, badCookie)) {
+		t.Error("both bad header and bad cookie should fail")
+	}
+}
+
+func TestRequireAuthDisabled(t *testing.T) {
+	s := &Docknap{configs: make(map[string]*Config)}
+	called := false
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusTeapot)
+	})
+	h := s.requireAuth(next)
+	rr := httptest.NewRecorder()
+	h(rr, httptest.NewRequest("GET", "/_docknap/", nil))
+	if !called {
+		t.Fatal("handler should run when auth disabled")
+	}
+	if rr.Code != http.StatusTeapot {
+		t.Errorf("status = %d, want %d", rr.Code, http.StatusTeapot)
+	}
+}
+
+func TestRequireAuthValidHeader(t *testing.T) {
+	s := newAuthTestDocknap(t)
+	called := false
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	})
+	h := s.requireAuth(next)
+	rr := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/_docknap/", nil)
+	r.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("admin:s3cret")))
+	h(rr, r)
+	if !called {
+		t.Fatal("handler should run with valid auth")
+	}
+	if rr.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", rr.Code, http.StatusOK)
+	}
+}
+
+func TestRequireAuthNoCredentialsServesLogin(t *testing.T) {
+	s := newAuthTestDocknap(t)
+	called := false
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { called = true })
+	h := s.requireAuth(next)
+	rr := httptest.NewRecorder()
+	h(rr, httptest.NewRequest("GET", "/_docknap/", nil))
+	if called {
+		t.Error("next should not be called without credentials")
+	}
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d", rr.Code, http.StatusUnauthorized)
+	}
+	if h := rr.Header().Get("WWW-Authenticate"); h != "" {
+		t.Errorf("WWW-Authenticate must not be set (would trigger browser dialog), got %q", h)
+	}
+	if ct := rr.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Errorf("Content-Type = %q, want text/html", ct)
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "DOCKNAP") || !strings.Contains(body, "authenticate") {
+		t.Errorf("login page should be served, body starts with: %s", first200(body))
+	}
+}
+
+func TestRequireAuthBadHeaderServesLoginWithError(t *testing.T) {
+	s := newAuthTestDocknap(t)
+	called := false
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { called = true })
+	h := s.requireAuth(next)
+	rr := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/_docknap/", nil)
+	r.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("admin:wrong")))
+	h(rr, r)
+	if called {
+		t.Error("next should not be called with bad header")
+	}
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d", rr.Code, http.StatusUnauthorized)
+	}
+	if !strings.Contains(rr.Body.String(), "invalid credentials") {
+		t.Errorf("login page should show error, body: %s", first200(rr.Body.String()))
+	}
+}
+
+func TestHandleLoginGetUnauthenticated(t *testing.T) {
+	s := newAuthTestDocknap(t)
+	rr := httptest.NewRecorder()
+	s.handleLogin(rr, httptest.NewRequest("GET", "/_docknap/auth/login", nil))
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d", rr.Code, http.StatusUnauthorized)
+	}
+	if !strings.Contains(rr.Body.String(), "user@docknap") {
+		t.Errorf("login form should be rendered, body: %s", first200(rr.Body.String()))
+	}
+}
+
+func TestHandleLoginGetAlreadyAuthenticatedRedirects(t *testing.T) {
+	s := newAuthTestDocknap(t)
+	rr := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/_docknap/auth/login?next=/_docknap/status", nil)
+	cookieVal := base64.StdEncoding.EncodeToString([]byte("admin:s3cret"))
+	r.AddCookie(&http.Cookie{Name: authCookieName, Value: cookieVal})
+	s.handleLogin(rr, r)
+	if rr.Code != http.StatusFound {
+		t.Errorf("status = %d, want %d", rr.Code, http.StatusFound)
+	}
+	if loc := rr.Header().Get("Location"); loc != "/_docknap/status" {
+		t.Errorf("Location = %q, want %q", loc, "/_docknap/status")
+	}
+}
+
+func TestHandleLoginGetErrorQuery(t *testing.T) {
+	s := newAuthTestDocknap(t)
+	rr := httptest.NewRecorder()
+	s.handleLogin(rr, httptest.NewRequest("GET", "/_docknap/auth/login?error=invalid", nil))
+	if !strings.Contains(rr.Body.String(), "invalid credentials") {
+		t.Errorf("error=invalid should render error, body: %s", first200(rr.Body.String()))
+	}
+}
+
+func TestHandleLoginGetBadMethod(t *testing.T) {
+	s := newAuthTestDocknap(t)
+	rr := httptest.NewRecorder()
+	s.handleLogin(rr, httptest.NewRequest("PUT", "/_docknap/auth/login", nil))
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d", rr.Code, http.StatusUnauthorized)
+	}
+	if allow := rr.Header().Get("Allow"); allow != "GET, POST" {
+		t.Errorf("Allow = %q, want %q", allow, "GET, POST")
+	}
+}
+
+func TestHandleLoginPostValid(t *testing.T) {
+	s := newAuthTestDocknap(t)
+	form := url.Values{}
+	form.Set("user", "admin")
+	form.Set("pass", "s3cret")
+	form.Set("next", "/_docknap/status")
+	rr := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/_docknap/auth/login", strings.NewReader(form.Encode()))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	s.handleLogin(rr, r)
+	if rr.Code != http.StatusFound {
+		t.Errorf("status = %d, want %d, body: %s", rr.Code, http.StatusFound, first200(rr.Body.String()))
+	}
+	if loc := rr.Header().Get("Location"); loc != "/_docknap/status" {
+		t.Errorf("Location = %q, want %q", loc, "/_docknap/status")
+	}
+	cookie := rr.Header().Get("Set-Cookie")
+	if !strings.Contains(cookie, authCookieName+"=") {
+		t.Errorf("expected Set-Cookie to include %s, got %q", authCookieName, cookie)
+	}
+	if !strings.Contains(cookie, "HttpOnly") {
+		t.Errorf("cookie should be HttpOnly, got %q", cookie)
+	}
+	if !strings.Contains(cookie, "SameSite=Lax") {
+		t.Errorf("cookie should be SameSite=Lax, got %q", cookie)
+	}
+}
+
+func TestHandleLoginPostInvalidCredentials(t *testing.T) {
+	s := newAuthTestDocknap(t)
+	form := url.Values{}
+	form.Set("user", "admin")
+	form.Set("pass", "wrong")
+	rr := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/_docknap/auth/login", strings.NewReader(form.Encode()))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	s.handleLogin(rr, r)
+	if rr.Code != http.StatusFound {
+		t.Errorf("status = %d, want %d", rr.Code, http.StatusFound)
+	}
+	loc := rr.Header().Get("Location")
+	if !strings.Contains(loc, "error=invalid") {
+		t.Errorf("expected redirect with error=invalid, got %q", loc)
+	}
+	if strings.Contains(rr.Header().Get("Set-Cookie"), authCookieName+"=") {
+		t.Errorf("no cookie should be set on failed login")
+	}
+}
+
+func TestHandleLoginPostMissingFields(t *testing.T) {
+	s := newAuthTestDocknap(t)
+	form := url.Values{}
+	form.Set("user", "")
+	form.Set("pass", "s3cret")
+	rr := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/_docknap/auth/login", strings.NewReader(form.Encode()))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	s.handleLogin(rr, r)
+	loc := rr.Header().Get("Location")
+	if !strings.Contains(loc, "error=missing") {
+		t.Errorf("expected redirect with error=missing, got %q", loc)
+	}
+}
+
+func TestHandleLoginPostOpenRedirectBlocked(t *testing.T) {
+	s := newAuthTestDocknap(t)
+	for _, evil := range []string{"https://evil.com", "//evil.com", "/\\evil.com"} {
+		form := url.Values{}
+		form.Set("user", "admin")
+		form.Set("pass", "s3cret")
+		form.Set("next", evil)
+		rr := httptest.NewRecorder()
+		r := httptest.NewRequest("POST", "/_docknap/auth/login", strings.NewReader(form.Encode()))
+		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		s.handleLogin(rr, r)
+		loc := rr.Header().Get("Location")
+		if loc == evil {
+			t.Errorf("open redirect: %q should be sanitized", evil)
+		}
+		if loc != "/_docknap/" {
+			t.Errorf("expected default %q for %q, got %q", "/_docknap/", evil, loc)
+		}
+	}
+}
+
+func TestHandleLogout(t *testing.T) {
+	s := newAuthTestDocknap(t)
+	rr := httptest.NewRecorder()
+	s.handleLogout(rr, httptest.NewRequest("POST", "/_docknap/auth/logout", nil))
+	if rr.Code != http.StatusFound {
+		t.Errorf("status = %d, want %d", rr.Code, http.StatusFound)
+	}
+	if loc := rr.Header().Get("Location"); loc != loginPath {
+		t.Errorf("Location = %q, want %q", loc, loginPath)
+	}
+	cookie := rr.Header().Get("Set-Cookie")
+	if !strings.Contains(cookie, authCookieName+"=") || !strings.Contains(cookie, "Max-Age=0") {
+		t.Errorf("logout should clear cookie, got %q", cookie)
+	}
+}
+
+func TestHandleLogoutRejectsGET(t *testing.T) {
+	s := newAuthTestDocknap(t)
+	rr := httptest.NewRecorder()
+	s.handleLogout(rr, httptest.NewRequest("GET", "/_docknap/auth/logout", nil))
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want %d", rr.Code, http.StatusMethodNotAllowed)
+	}
+}
+
+func TestRequestIsHTTPS(t *testing.T) {
+	r := httptest.NewRequest("GET", "/", nil)
+	if requestIsHTTPS(r) {
+		t.Error("plain HTTP request should not be HTTPS")
+	}
+	r.Header.Set("X-Forwarded-Proto", "https")
+	if !requestIsHTTPS(r) {
+		t.Error("X-Forwarded-Proto: https should be HTTPS")
+	}
+	r.Header.Set("X-Forwarded-Proto", "HTTPS")
+	if !requestIsHTTPS(r) {
+		t.Error("X-Forwarded-Proto: HTTPS (uppercase) should be HTTPS")
+	}
+	r.Header.Set("X-Forwarded-Proto", "http")
+	if requestIsHTTPS(r) {
+		t.Error("X-Forwarded-Proto: http should not be HTTPS")
+	}
+}
+
+func first200(s string) string {
+	if len(s) > 200 {
+		return s[:200] + "..."
+	}
+	return s
+}

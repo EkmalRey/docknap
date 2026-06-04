@@ -5,6 +5,17 @@ All notable changes to docknap will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.5] - 2026-06-04
+
+### Changed
+- Replaced the browser's default HTTP Basic Auth dialog on admin endpoints with a themed in-app login page at `/_docknap/auth/login`. The page matches the existing docknap visual language (monospace, dark green/cyan, scanline overlay, blinking cursor) and exposes a `user@docknap` / `password` form that POSTs to the same endpoint. The browser will no longer pop the native `Authentication Required` dialog. All `/_docknap/*` endpoints still require auth except `/_docknap/wait/`.
+- A successful login now sets a `docknap_auth` session cookie (`HttpOnly`, `SameSite=Lax`, `Secure` when the request is HTTPS — `r.TLS != nil` or `X-Forwarded-Proto: https`, `Max-Age=12h`). Subsequent admin requests are accepted with the cookie or, as before, with an `Authorization: Basic` header — so curl/scripts that use `-u user:pass` keep working unchanged.
+- The admin UI header now has a `logout` button that POSTs to `/_docknap/auth/logout` and clears the cookie. Without it the cookie would persist for 12h since the browser has no UI to clear an HTTP-Basic-style session.
+- `?next=/path` is preserved across the login flow so a user hitting `/_docknap/status` directly is bounced through login and back. `next` is restricted to relative same-origin paths to prevent open redirects.
+
+### Tests
+- New `auth_test.go` covering: `parseBasicAuth` (valid / wrong prefix / bad base64 / no colon), `safeRedirect` (open-redirect vectors), `verifyCredentials`, `checkRequestAuth` (header vs cookie, both, neither), `requireAuth` (disabled / valid header / no creds -> themed login / bad header -> login with error), `handleLogin` (GET unauthenticated / GET already-authenticated redirect / error query / bad method / POST valid / POST invalid / POST missing fields / POST open-redirect sanitization), `handleLogout` (POST clears cookie / GET rejected), and `requestIsHTTPS` (X-Forwarded-Proto).
+
 ## [0.1.4] - 2026-06-02
 
 ### Fixed
