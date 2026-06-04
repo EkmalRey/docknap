@@ -1,3 +1,21 @@
+// Package main: metrics registry.
+//
+// Note on prometheus/client_golang: the project ships a hand-rolled
+// Prometheus text-format registry (~330 lines) instead of pulling in
+// github.com/prometheus/client_golang. The reasons are:
+//
+//   - docknap is a single static binary; adding a non-trivial client
+//     dependency pulls 6 MB+ of transitive code and a default Go HTTP
+//     handler we do not need.
+//   - The metrics surface is small (counters, gauges, one histogram pair)
+//     and stable; the text format is ~150 lines of fmt.Fprintf.
+//   - The text format output has a small but full test suite
+//     (metrics_test.go).
+//
+// If the project later needs exemplars, native histograms, push gateway,
+// or a /metrics handler with content negotiation, swap to
+// prometheus/client_golang and delete this file.
+
 package main
 
 import (
@@ -255,6 +273,25 @@ func (r *Registry) writeTo(w io.Writer, subdomain string) {
 
 func (r *Registry) WriteToFiltered(w io.Writer, subdomain string) {
 	r.writeTo(w, subdomain)
+}
+
+func (r *Registry) HistogramStats(name, subdomain string) (sum float64, count uint64) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, h := range r.histograms {
+		if h.name != name {
+			continue
+		}
+		for k, c := range h.counts {
+			labels := parseKey(h.labels, k)
+			if labels["subdomain"] != subdomain {
+				continue
+			}
+			sum += h.sums[k]
+			count += c
+		}
+	}
+	return
 }
 
 func hasLabel(names []string, target string) bool {

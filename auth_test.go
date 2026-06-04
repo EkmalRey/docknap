@@ -15,15 +15,33 @@ import (
 
 func newAuthTestDocknap(t *testing.T) *Docknap {
 	t.Helper()
+	reg := NewRegistry()
 	s := &Docknap{
-		adminUser:  "admin",
-		configs:    make(map[string]*Config),
-		idleTimers: make(map[string]*time.Timer),
-		bootStarts: make(map[string]time.Time),
-		startedAt:  make(map[string]time.Time),
-		events:     make(map[string][]Event),
-		startLocks: make(map[string]*sync.Mutex),
-		logger:     NewLogger(io.Discard, false),
+		adminUser:   "admin",
+		configs:     make(map[string]*Config),
+		idleTimers:  make(map[string]*time.Timer),
+		bootStarts:  make(map[string]time.Time),
+		startedAt:   make(map[string]time.Time),
+		events:      make(map[string][]Event),
+		startLocks:  make(map[string]*sync.Mutex),
+		states:      make(map[string]*serviceState),
+		ipCache:     make(map[string]string),
+		ipCacheAt:   make(map[string]time.Time),
+		logger:      NewLogger(io.Discard, false),
+		metrics:     reg,
+		sessions:    newSessionStore(12 * time.Hour),
+		rateLimiter: newLoginRateLimiter(5, time.Minute),
+	}
+	s.m = &Metrics{
+		AuthFail:   reg.Counter("docknap_admin_auth_failures_total", "x", []string{"path", "reason"}),
+		Proxy:      reg.Counter("docknap_proxy_requests_total", "x", []string{"subdomain", "status"}),
+		Starts:     reg.Counter("docknap_container_starts_total", "x", []string{"subdomain"}),
+		Stops:      reg.Counter("docknap_container_stops_total", "x", []string{"subdomain", "reason"}),
+		IdleStop:   reg.Counter("docknap_idle_timeouts_total", "x", []string{"subdomain"}),
+		StartFail:  reg.Counter("docknap_startup_failures_total", "x", []string{"subdomain", "reason"}),
+		StartDur:   reg.Histogram("docknap_start_duration_seconds", "x", []string{"subdomain"}, []float64{1, 5, 10}),
+		ProxyDur:   reg.Histogram("docknap_proxy_duration_seconds", "x", []string{"subdomain"}, []float64{0.1, 1}),
+		Registered: reg.Gauge("docknap_registered_containers", "x", nil),
 	}
 	userSum := sha256.Sum256([]byte("admin"))
 	s.adminUserHash = userSum[:]
@@ -33,11 +51,11 @@ func newAuthTestDocknap(t *testing.T) *Docknap {
 
 func TestParseBasicAuth(t *testing.T) {
 	cases := []struct {
-		name    string
-		header  string
-		wantU   string
-		wantP   string
-		wantOK  bool
+		name   string
+		header string
+		wantU  string
+		wantP  string
+		wantOK bool
 	}{
 		{"valid", "Basic " + base64.StdEncoding.EncodeToString([]byte("admin:secret")), "admin", "secret", true},
 		{"empty password", "Basic " + base64.StdEncoding.EncodeToString([]byte("admin:")), "admin", "", true},
@@ -125,8 +143,10 @@ func TestCheckRequestAuth(t *testing.T) {
 	}
 	goodAuth := "Basic " + base64.StdEncoding.EncodeToString([]byte("admin:s3cret"))
 	badAuth := "Basic " + base64.StdEncoding.EncodeToString([]byte("admin:wrong"))
-	goodCookie := base64.StdEncoding.EncodeToString([]byte("admin:s3cret"))
-	badCookie := base64.StdEncoding.EncodeToString([]byte("admin:wrong"))
+	goodCookie, err := s.sessions.issue()
+	if err != nil {
+		t.Fatalf("issue session: %v", err)
+	}
 
 	if !s.checkRequestAuth(mkReq(goodAuth, "")) {
 		t.Error("valid Authorization header should pass")
@@ -140,13 +160,13 @@ func TestCheckRequestAuth(t *testing.T) {
 	if s.checkRequestAuth(mkReq(badAuth, "")) {
 		t.Error("bad Authorization should fail")
 	}
-	if s.checkRequestAuth(mkReq("", badCookie)) {
-		t.Error("bad cookie should fail")
+	if s.checkRequestAuth(mkReq("", "not-a-real-token")) {
+		t.Error("invalid cookie should fail")
 	}
-	if !s.checkRequestAuth(mkReq(goodAuth, badCookie)) {
+	if !s.checkRequestAuth(mkReq(goodAuth, "not-a-real-token")) {
 		t.Error("good header alone should be enough even with a bad cookie")
 	}
-	if s.checkRequestAuth(mkReq(badAuth, badCookie)) {
+	if s.checkRequestAuth(mkReq(badAuth, "not-a-real-token")) {
 		t.Error("both bad header and bad cookie should fail")
 	}
 }
@@ -248,10 +268,13 @@ func TestHandleLoginGetUnauthenticated(t *testing.T) {
 
 func TestHandleLoginGetAlreadyAuthenticatedRedirects(t *testing.T) {
 	s := newAuthTestDocknap(t)
+	tok, err := s.sessions.issue()
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
 	rr := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", "/_docknap/auth/login?next=/_docknap/status", nil)
-	cookieVal := base64.StdEncoding.EncodeToString([]byte("admin:s3cret"))
-	r.AddCookie(&http.Cookie{Name: authCookieName, Value: cookieVal})
+	r.AddCookie(&http.Cookie{Name: authCookieName, Value: tok})
 	s.handleLogin(rr, r)
 	if rr.Code != http.StatusFound {
 		t.Errorf("status = %d, want %d", rr.Code, http.StatusFound)

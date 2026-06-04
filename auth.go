@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -34,11 +35,6 @@ func (s *Docknap) verifyCredentials(user, pass string) bool {
 	return userMatch && passMatch
 }
 
-// requireAuth gates admin endpoints. A request is authenticated if it carries
-// either a valid HTTP Basic Auth header (Authorization: Basic ...) or a
-// valid docknap_auth session cookie set by the custom login form. On
-// failure, it serves the themed login page; we deliberately do not set
-// WWW-Authenticate so the browser's native dialog does not appear.
 func (s *Docknap) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !s.authEnabled() {
@@ -62,11 +58,7 @@ func (s *Docknap) checkRequestAuth(r *http.Request) bool {
 		return s.verifyCredentials(user, pass)
 	}
 	if cookie, err := r.Cookie(authCookieName); err == nil && cookie.Value != "" {
-		if decoded, derr := base64.StdEncoding.DecodeString(cookie.Value); derr == nil {
-			if user, pass, ok := strings.Cut(string(decoded), ":"); ok {
-				return s.verifyCredentials(user, pass)
-			}
-		}
+		return s.sessions.valid(cookie.Value)
 	}
 	return false
 }
@@ -88,16 +80,13 @@ func parseBasicAuth(header string) (user, pass string, ok bool) {
 }
 
 func (s *Docknap) failAuth(w http.ResponseWriter, r *http.Request, reason string) {
-	if s.mAuthFail != nil {
-		s.mAuthFail.Add(map[string]string{"path": r.URL.Path, "reason": reason}, 1)
+	if s.m.AuthFail != nil {
+		s.m.AuthFail.Add(map[string]string{"path": r.URL.Path, "reason": reason}, 1)
 	}
 	s.logger.Warn("auth failed", F("path", r.URL.Path), F("reason", reason), F("remote", r.RemoteAddr))
 	s.serveLogin(w, r, "invalid")
 }
 
-// handleLogin serves the themed login form on GET and processes credentials
-// on POST. The endpoint is intentionally NOT wrapped by requireAuth; it is
-// the entry point for unauthenticated users.
 func (s *Docknap) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if !s.authEnabled() {
 		http.NotFound(w, r)
@@ -123,6 +112,13 @@ func (s *Docknap) handleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Docknap) processLogin(w http.ResponseWriter, r *http.Request) {
+	remoteKey := clientKey(r)
+	if !s.rateLimiter.allow(remoteKey) {
+		s.m.AuthFail.Add(map[string]string{"path": r.URL.Path, "reason": "rate_limited"}, 1)
+		s.logger.Warn("login rate-limited", F("remote", r.RemoteAddr))
+		s.failLogin(w, r, "", "rate_limited")
+		return
+	}
 	if err := r.ParseForm(); err != nil {
 		s.renderLogin(w, r, "bad_request", "")
 		return
@@ -137,9 +133,7 @@ func (s *Docknap) processLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !s.verifyCredentials(user, pass) {
-		if s.mAuthFail != nil {
-			s.mAuthFail.Add(map[string]string{"path": r.URL.Path, "reason": "invalid"}, 1)
-		}
+		s.m.AuthFail.Add(map[string]string{"path": r.URL.Path, "reason": "invalid"}, 1)
 		s.logger.Warn("auth failed",
 			F("path", r.URL.Path),
 			F("reason", "invalid"),
@@ -149,18 +143,39 @@ func (s *Docknap) processLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	tok, err := s.sessions.issue()
+	if err != nil {
+		s.logger.Error("session issue failed", F("err", err.Error()))
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     authCookieName,
-		Value:    base64.StdEncoding.EncodeToString([]byte(user + ":" + pass)),
+		Value:    tok,
 		Path:     "/",
 		HttpOnly: true,
-		Secure:   requestIsHTTPS(r),
+		Secure:   s.requestIsHTTPS(r),
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   int(authCookieMaxAge.Seconds()),
 	})
-
-	s.logger.Info("admin login", F("user", user), F("remote", r.RemoteAddr))
+	s.logger.Info("admin login",
+		F("user", user),
+		F("remote", r.RemoteAddr),
+		F("method", "session_cookie"),
+	)
 	http.Redirect(w, r, safeRedirect(next, "/_docknap/"), http.StatusFound)
+}
+
+func clientKey(r *http.Request) string {
+	host, _, err := splitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	return host
+}
+
+func splitHostPort(s string) (host, port string, err error) {
+	return netSplitHostPort(s)
 }
 
 func (s *Docknap) failLogin(w http.ResponseWriter, r *http.Request, next, errCode string) {
@@ -169,7 +184,7 @@ func (s *Docknap) failLogin(w http.ResponseWriter, r *http.Request, next, errCod
 	if strings.Contains(target, "?") {
 		sep = "&"
 	}
-	http.Redirect(w, r, target+sep+"error="+errCode, http.StatusFound)
+	http.Redirect(w, r, target+sep+"error="+url.QueryEscape(errCode), http.StatusFound)
 }
 
 func (s *Docknap) handleLogout(w http.ResponseWriter, r *http.Request) {
@@ -178,21 +193,33 @@ func (s *Docknap) handleLogout(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if cookie, err := r.Cookie(authCookieName); err == nil {
+		s.sessions.revoke(cookie.Value)
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     authCookieName,
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
-		Secure:   requestIsHTTPS(r),
+		Secure:   s.requestIsHTTPS(r),
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   -1,
 	})
 	http.Redirect(w, r, loginPath, http.StatusFound)
 }
 
-// requestIsHTTPS reports whether the request reached us over HTTPS, taking
-// a standard X-Forwarded-Proto header from a TLS-terminating reverse proxy
-// into account. Used to set the Secure flag on cookies.
+func (s *Docknap) requestIsHTTPS(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	if !s.trustedProxy(r) {
+		return false
+	}
+	return strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+}
+
+// requestIsHTTPSRaw is a free-function variant used by tests; it does not
+// honor DOCKNAP_TRUSTED_PROXIES. Use s.requestIsHTTPS in handler code.
 func requestIsHTTPS(r *http.Request) bool {
 	if r.TLS != nil {
 		return true
@@ -200,9 +227,6 @@ func requestIsHTTPS(r *http.Request) bool {
 	return strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
 }
 
-// safeRedirect validates that next is a relative same-origin path so the
-// login form can be used to bounce a user back to where they came from
-// without enabling an open redirect. Returns defaultPath if next is unsafe.
 func safeRedirect(next, defaultPath string) string {
 	if next == "" {
 		return defaultPath
@@ -220,17 +244,6 @@ func (s *Docknap) serveLogin(w http.ResponseWriter, r *http.Request, errMsg stri
 	s.renderLogin(w, r, errMsg, r.URL.Query().Get("next"))
 }
 
-func (s *Docknap) renderLogin(w http.ResponseWriter, r *http.Request, errMsg, next string) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(http.StatusUnauthorized)
-	page := strings.NewReplacer(
-		"{ERR_BLOCK}", loginErrorBlock(errMsg),
-		"{NEXT}", htmlEscape(next),
-	).Replace(loginPage)
-	w.Write([]byte(page))
-}
-
 func loginErrorBlock(errCode string) string {
 	if errCode == "" {
 		return ""
@@ -245,6 +258,8 @@ func loginErrorBlock(errCode string) string {
 		friendly = "unsupported method"
 	case "bad_request":
 		friendly = "bad request"
+	case "rate_limited":
+		friendly = "too many attempts, try again shortly"
 	default:
 		friendly = errCode
 	}

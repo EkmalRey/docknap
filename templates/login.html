@@ -1,11 +1,4 @@
-package main
-
-// loginPage is the themed HTML for the admin auth login form. It is
-// served on a 401 from requireAuth (or when an unauthenticated user
-// navigates to /_docknap/auth/login) instead of the browser's default
-// HTTP Basic Auth dialog. Placeholders {ERR_BLOCK} and {NEXT} are
-// substituted by renderLogin.
-const loginPage = `<!doctype html>
+<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -202,9 +195,9 @@ const loginPage = `<!doctype html>
     <div class="scan-track"><div class="scan-bar"></div></div>
     <div class="scan-label">awaiting credentials&hellip; <b>secure channel</b></div>
   </div>
-  {ERR_BLOCK}
+  {{.ErrBlock}}
   <form method="POST" action="/_docknap/auth/login" autocomplete="on">
-    <input type="hidden" name="next" value="{NEXT}">
+    <input type="hidden" name="next" value="{{.Next}}">
     <div class="field">
       <span class="lbl">user@docknap</span>
       <span class="sep">:</span>
@@ -230,4 +223,4 @@ const loginPage = `<!doctype html>
 </div>
 <footer>// docknap.daemon &middot; powered by docknap</footer>
 </body>
-</html>`
+</html>

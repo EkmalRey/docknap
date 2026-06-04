@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{{.Subdomain}}</title>
+<meta name="robots" content="noindex,nofollow">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  :root {
+    --bg: {{.ThemeBG}};
+    --fg: {{.ThemeFG}};
+    --dim: {{.ThemeDim}};
+    --accent: {{.ThemeAccent}};
+    --border: {{.ThemeBorder}};
+    --warn: #ffb454;
+    --err: #ff5370;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg); font-family: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace; min-height: 100vh; }
+  body { display: flex; flex-direction: column; padding: 2rem; max-width: 760px; margin: 0 auto; }
+  .scanline { position: fixed; inset: 0; background: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(255,255,255,0.015) 2px, rgba(255,255,255,0.015) 4px); pointer-events: none; z-index: 100; }
+  header { border-bottom: 1px solid var(--border); padding-bottom: 1rem; margin-bottom: 1.5rem; }
+  .logo { font-size: 0.95rem; color: var(--accent); letter-spacing: 0.05em; }
+  .logo::before { content: "▌ "; color: var(--fg); }
+  .subtitle { color: var(--dim); font-size: 0.8rem; margin-top: 0.4rem; }
+  .card { background: rgba(255,255,255,0.02); border: 1px solid var(--border); border-radius: 4px; padding: 1.5rem; }
+  .head { display: flex; align-items: center; gap: 1rem; margin-bottom: 1.25rem; }
+  .icon { font-size: 2rem; color: var(--accent); animation: pulse 1.2s ease-in-out infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+  .title { font-size: 1.25rem; }
+  .title b { color: var(--accent); }
+  .status { color: var(--dim); font-size: 0.8rem; margin-top: 0.3rem; min-height: 1.2em; }
+  .progress { height: 4px; background: var(--border); border-radius: 2px; overflow: hidden; margin-bottom: 1rem; }
+  .progress-bar { height: 100%; background: linear-gradient(90deg, var(--fg), var(--accent)); width: 0%; transition: width 0.4s ease; }
+  .log { font-size: 0.78rem; line-height: 1.55; color: var(--dim); max-height: 220px; overflow-y: auto; }
+  .log .line { white-space: pre-wrap; word-break: break-word; }
+  .log .ts { color: var(--dim); opacity: 0.7; }
+  .log .ok { color: var(--fg); }
+  .log .info { color: var(--accent); }
+  .log .warn { color: var(--warn); }
+  .log .err { color: var(--err); }
+  .meta { display: flex; gap: 1.5rem; margin-top: 1.25rem; padding-top: 1rem; border-top: 1px solid var(--border); font-size: 0.78rem; color: var(--dim); }
+  .meta .item b { color: var(--fg); font-weight: normal; }
+  .failed { text-align: center; padding: 2rem 1rem; }
+  .failed .icon { color: var(--err); font-size: 3rem; animation: none; }
+  .failed h2 { margin: 1rem 0 0.5rem; color: var(--err); }
+  .failed p { color: var(--dim); margin: 0.5rem 0 1.5rem; }
+  .btn { display: inline-block; background: transparent; border: 1px solid var(--accent); color: var(--accent); padding: 0.6rem 1.4rem; font: inherit; cursor: pointer; border-radius: 3px; text-transform: uppercase; letter-spacing: 0.1em; font-size: 0.8rem; }
+  .btn:hover { background: var(--accent); color: var(--bg); }
+  footer { margin-top: 2rem; color: var(--dim); font-size: 0.72rem; text-align: center; opacity: 0.6; }
+</style>
+</head>
+<body>
+<div class="scanline"></div>
+<header>
+  <div class="logo">DOCKNAP</div>
+  <div class="subtitle">{{.Subtitle}}</div>
+</header>
+<div class="card" id="card">
+  <div class="head">
+    <div class="icon" id="icon">{{.Icon}}</div>
+    <div>
+      <div class="title">Starting <b>{{.Title}}</b></div>
+      <div class="status" id="status">waking up&hellip;</div>
+    </div>
+  </div>
+  <div class="progress"><div class="progress-bar" id="bar"></div></div>
+  <div class="log" id="log" style="display:{{.ShowLogs}}"></div>
+  <div class="meta" id="meta" style="display:{{.ShowStats}}">
+    <div class="item">elapsed <b id="elapsed">0s</b></div>
+    <div class="item">timeout <b>{{.Timeout}}s</b></div>
+  </div>
+</div>
+<footer>powered by docknap</footer>
+<script>
+const SHOW_LOGS = {{.ShowLogs}};
+const SHOW_STATS = {{.ShowStats}};
+const TIMEOUT_S = {{.Timeout}};
+const BOOT_MSGS = {{.BootLines}};
+const startTime = Date.now();
+let pollCount = 0;
+let stopped = false;
+
+const log = document.getElementById('log');
+const status = document.getElementById('status');
+const bar = document.getElementById('bar');
+const icon = document.getElementById('icon');
+const elapsed = document.getElementById('elapsed');
+const card = document.getElementById('card');
+const meta = document.getElementById('meta');
+
+function ts() { return new Date().toTimeString().slice(0,8); }
+function addLine(cls, text) {
+  if (!SHOW_LOGS) return;
+  const line = document.createElement('div');
+  line.className = 'line ' + (cls || '');
+  line.innerHTML = '<span class="ts">[' + ts() + ']</span> ' + text;
+  log.appendChild(line);
+  log.scrollTop = log.scrollHeight;
+}
+function tickProgress() {
+  const s = (Date.now() - startTime) / 1000;
+  const pct = Math.min(95, (s / TIMEOUT_S) * 95);
+  bar.style.width = pct + '%';
+}
+function tickElapsed() {
+  const s = Math.floor((Date.now() - startTime) / 1000);
+  elapsed.textContent = s < 60 ? s + 's' : Math.floor(s/60) + 'm ' + (s%60) + 's';
+}
+
+setInterval(tickProgress, 250);
+setInterval(tickElapsed, 1000);
+
+if (SHOW_LOGS) {
+  addLine('info', 'request received');
+  addLine('info', 'checking service status...');
+}
+
+async function poll() {
+  if (stopped) return;
+  pollCount++;
+  try {
+    const res = await fetch('/_docknap/wait/{{.Subdomain}}', { cache: 'no-store' });
+    const data = await res.json();
+    if (data.ready) {
+      addLine('ok', 'service is ready');
+      bar.style.width = '100%';
+      icon.textContent = '✓';
+      icon.style.color = 'var(--fg)';
+      status.textContent = 'ready, loading...';
+      stopped = true;
+      setTimeout(() => window.location.reload(), 400);
+      return;
+    }
+    if (data.timed_out) {
+      showFailed();
+      return;
+    }
+    status.textContent = 'starting up...';
+    if (SHOW_LOGS && pollCount % 4 === 0 && BOOT_MSGS.length) {
+      addLine('info', BOOT_MSGS[pollCount % BOOT_MSGS.length]);
+    }
+  } catch (e) {
+    if (SHOW_LOGS) addLine('err', 'connection lost: ' + e.message);
+  }
+  setTimeout(poll, 1000);
+}
+
+function showFailed() {
+  stopped = true;
+  card.innerHTML = '<div class="failed">' +
+    '<div class="icon">✗</div>' +
+    '<h2>Startup timed out</h2>' +
+    '<p>{{.Title}} did not become ready within ' + TIMEOUT_S + ' seconds.</p>' +
+    '<button class="btn" onclick="retry()">Retry</button>' +
+  '</div>';
+}
+
+function retry() {
+  window.location.reload();
+}
+
+setTimeout(poll, 300);
+</script>
+</body>
+</html>

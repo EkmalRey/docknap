@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>docknap // 404</title>
+<style>
+  :root { --bg: #0a0e14; --fg: #00ff9c; --dim: #4a6a5a; --accent: #00d4ff; --border: #1a2a22; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg); font-family: 'JetBrains Mono', monospace; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+  .card { text-align: center; border: 1px solid var(--border); padding: 2rem 3rem; border-radius: 4px; }
+  h1 { color: var(--accent); margin: 0 0 0.5rem 0; }
+  p { color: var(--dim); margin: 0; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>404</h1>
+  <p>no registered service for <b>{{.Subdomain}}</b></p>
+  <p><a href="/_docknap/">admin</a></p>
+</div>
+</body>
+</html>

@@ -1,0 +1,33 @@
+services:
+  docknap:
+    build: ../..
+    container_name: docknap-it
+    restart: "no"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - DOCKNAP_LISTEN=:8000
+      - DOCKNAP_IDLE_DEFAULT=5s
+      - DOCKNAP_START_TIMEOUT=30s
+      - DOCKNAP_NETWORK=docknap-it_network
+      - DOCKNAP_LOG_FORMAT=json
+    networks:
+      - docknap-it_network
+
+  demo:
+    image: nginx:alpine
+    container_name: docknap-demo
+    labels:
+      - "docknap.enable=true"
+      - "docknap.subdomain=demo"
+      - "docknap.target_port=80"
+      - "docknap.idle_timeout=5s"
+      - "docknap.startup_timeout=30s"
+      - "docknap.theme=green"
+    networks:
+      - docknap-it_network
+
+networks:
+  docknap-it_network:
+    name: docknap-it_network
+    driver: bridge

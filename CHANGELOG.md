@@ -5,6 +5,55 @@ All notable changes to docknap will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-06-04
+
+### Changed
+- **HTTP health probe** via `docknap.health_path` label. If set, docknap issues a 1-second HTTP GET to `<ip>:<port><health_path>` and considers the service ready only on a 2xx/3xx response. Default behavior (plain TCP dial) is unchanged. Lets apps that bind a port before they're actually serving (e.g. Python, JVM) finish initializing before the proxy forwards traffic.
+- **Write timeout is now bounded.** A new `DOCKNAP_WRITE_TIMEOUT` env var (default `60s`) replaces the previous `WriteTimeout: 0`. Slow clients can no longer hold proxy connections open indefinitely and exhaust file descriptors. Set `DOCKNAP_WRITE_TIMEOUT=0` to restore unbounded writes (e.g. for SSE / long polling).
+- **Watch loop now subscribes to Docker events** (`start`, `die`, `stop`, `destroy`, `create`, `rename`) for the configured network. Changes are debounced at 500 ms and a full resync runs every 10 s as a safety net. The pure-poll watcher is preserved as a fallback if the events stream errors out. Label changes on running containers are picked up immediately rather than waiting for a restart.
+- **Wake endpoint is POST-only** (`GET /_docknap/wake/<sub>` now returns 405). Stops browser pre-fetch, link previews, and access logs from inadvertently waking stopped services.
+- **Per-service state is cached** in `s.states` (running/exited/created/etc.) and updated by the watch loop. `handleStatus` and the `docknap_container_state` gauge no longer re-inspect every container on each call. The `docknap_container_state` gauge is now refreshed only when state actually changes; metrics scrapes read the cached value.
+- **Container IP is cached** for 30 s in `s.ipCache`. Eliminates the per-request `ContainerInspect` call from the proxy hot path on a busy service.
+- **`handleProxy` inspects the port under the startLock** so that a stale `Running` reading (from a container that just exited on idle) cannot cause the proxy to skip the loading page and then `getTargetURL` to fail. A second `checkPort` after the lock is acquired catches the race.
+- **Subdomain extraction** now takes a `tldCount` argument: with `tldCount=N`, the subdomain is everything except the rightmost `N` dot-separated parts. This enables multi-level subdomains like `myapp.staging.internal → myapp.staging` (with `DOCKNAP_TLD_COUNT=2`). Default behavior with `DOCKNAP_TLD_COUNT=1` is "everything before the rightmost label". This is a small semantic change from v0.1.x, which always returned the first part.
+- **Loading-page boot messages are configurable** via `docknap.boot_messages` (pipe-separated). When unset, docknap uses the original five fixed lines.
+- **HTML templates moved to `templates/*.html`** and parsed with `html/template` at startup via `embed.FS`. The fragile `{PLACEHOLDER}` `strings.NewReplacer` pattern is gone; templates use proper Go template syntax with auto-escaping.
+- **Code is split into single-responsibility files** (`config.go`, `registry.go`, `docker.go`, `proxy.go`, `timers.go`, `templates.go`, `sessions.go`, `ratelimit.go`, `cidr.go`, `logs.go`, `handlers_*.go`). `main.go` is now ~190 lines (just startup, signal handling, shutdown).
+
+### Added
+- **`/_docknap/config`** — JSON snapshot of the current parsed configuration for every registered service (no secrets, no runtime state). Use for gitops, diffing, and dashboards. Requires admin auth.
+- **`/_docknap/wake_all`** and **`/_docknap/stop_all`** — POST endpoints that wake every stopped service or stop every running service. Surfaced in the admin UI as buttons. Requires admin auth.
+- **`docknap.live_logs=true`** label — when set, `/_docknap/logs/<sub>` becomes a Server-Sent Events stream of the container's stdout+stderr. Useful for diagnosing startup failures without `docker logs`. Off by default (opt-in per-service).
+- **`DOCKNAP_WRITE_TIMEOUT`** env var (default `60s`).
+- **`DOCKNAP_TLD_COUNT`** env var (default `1`).
+- **`DOCKNAP_TRUSTED_PROXIES`** env var — comma-separated CIDRs that are allowed to set `X-Forwarded-Proto`. When unset, docknap ignores the header entirely. When set, only requests from the listed CIDRs can trigger HTTPS-only cookie behavior.
+- **Per-IP login rate limiter** — 5 failed POSTs per IP per minute before the login form returns `error=rate_limited`. Counter resets when the window passes. Logged and counted in `docknap_admin_auth_failures_total{reason="rate_limited"}`.
+- **Opaque session tokens** — the `docknap_auth` cookie value is now a 256-bit random token, not `base64(user:password)`. Tokens are stored in an in-memory map keyed by token with a 12-hour TTL, revoked on logout, and GC'd every 5 minutes. The old `Authorization: Basic` flow is still supported for scripts/curl.
+- **Broadcast-on-ready** — when the inner port-ready goroutine observes a port is open, it broadcasts on a per-subdomain channel. All concurrent waiters on `/_docknap/wait/<sub>` (loading page, wake endpoints) wake from the same event instead of each running their own ticker.
+- **`startup_stats` field in `/_docknap/history/<sub>`** — count / sum / avg of `docknap_start_duration_seconds` observations for the service, derived from the existing histogram.
+- **`/healthz`** is unchanged but explicitly documented to not require auth.
+- **Logging includes which auth path was used** — `method=session_cookie` on successful logins; `method=basic` is implied by Authorization-header successes. Makes audit trails unambiguous.
+- **Logging shows version** at startup and on the admin UI footer (`v{VERSION}`).
+- **`SECURITY.md`** with threat model, supported-versions table, and disclosure process.
+- **`Makefile`** with `make build`, `make test`, `make cover`, `make docker`, `make integration`. `VERSION` is set from `git describe --tags --always --dirty`.
+- **Integration test harness** at `tests/integration/run.sh` + `docker-compose.yml` that exercises the wake / stop / idle cycle against a real `nginx:alpine` container. Run with `make integration` (requires Docker, `curl`, `jq`).
+- **CI coverage step** — `go test -coverprofile=coverage.txt -covermode=atomic` runs on every push; the artifact is uploaded for inspection. (Not gated on a threshold; that comes once we have one.)
+- **GitHub release workflow** now passes `VERSION` as a Docker build-arg so the `main.version` variable baked into the binary matches the tag.
+
+### Fixed
+- **`proxy.ErrorHandler` no longer corrupts partial responses** when the upstream disconnects mid-stream. The handler now checks `statusRecorder.headersSent()` and aborts the connection instead of writing a full HTML page on top of partial body bytes.
+- **Shutdown iterates idle timers under a read lock**, closing a `go test -race`-detectable race against the watch goroutine's last write. The `watch()` goroutine is now driven by `rootCtx.Done()` only and exits before timers are stopped.
+- **Background start-ready goroutine is bound to `rootCtx`** (not `context.Background()`), so a `SIGTERM` mid-start cancels the ticker without leaking.
+- **`requestIsHTTPS` honors `DOCKNAP_TRUSTED_PROXIES`** before trusting `X-Forwarded-Proto`. Untrusted clients can no longer trick docknap into setting `Secure` on a cookie delivered over plain HTTP.
+- **`handleStatus` no longer crashes on a missing container** — falls back to `state="unknown"` instead of returning 500.
+- **`handleWait` and `handleProxy` no longer race on `bootStarts`/`startedAt`** — both functions take/release the relevant map mutations under `s.mu`.
+- **`discover` records `container.StartedAt`** for already-running containers, so `uptime_s` and `started_at` are populated from the very first request.
+
+### Security
+- **Session cookie no longer contains the password.** See "Opaque session tokens" above.
+- **Per-IP login rate limiting** to slow credential stuffing.
+- **Trusted-proxy CIDR list** to avoid `X-Forwarded-Proto` spoofing.
+
 ## [0.1.5] - 2026-06-04
 
 ### Changed
@@ -78,12 +127,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Admin UI at `/_docknap`, `/_docknap/`, `/_docknap/ui` with live service table, Wake/Stop buttons, and 2-second auto-refresh
 - Prometheus metrics at `/_docknap/metrics` with per-service filtering at `/_docknap/metrics/<sub>`
 - Per-service history endpoint at `/_docknap/history/<sub>` with state, event counts, and a 100-event ring buffer
-- Structured logging in text or JSON mode (configurable via `DOCKNAP_LOG_FORMAT`)
-- HTTP Basic Auth on admin endpoints via `DOCKNAP_ADMIN_USER` / `DOCKNAP_ADMIN_PASS` env vars (constant-time compare, SHA-256 in memory)
-- Multi-arch Docker image (linux/amd64, linux/arm64)
-- CI: build and test on push; multi-arch image push to GHCR on tag
-
-### Notes
-- Project was previously called "sleeper" — renamed to "docknap" in this release
-- Network `sleeper_network` is now `docknap_network`
-- All env vars, labels, endpoints, and metric names have been renamed

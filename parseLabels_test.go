@@ -7,8 +7,9 @@ import (
 
 func newTestDocknap() *Docknap {
 	return &Docknap{
-		idleDefault: 5 * time.Minute,
-		events:      make(map[string][]Event),
+		idleDefault:         5 * time.Minute,
+		startTimeoutDefault: 60 * time.Second,
+		events:              make(map[string][]Event),
 	}
 }
 
@@ -90,17 +91,17 @@ func TestParseLabels_Defaults(t *testing.T) {
 func TestParseLabels_Overrides(t *testing.T) {
 	s := newTestDocknap()
 	cfg, ok := s.parseLabels(map[string]string{
-		"docknap.enable":         "true",
-		"docknap.subdomain":      "myapp",
-		"docknap.target_port":    "8080",
-		"docknap.idle_timeout":   "15m",
+		"docknap.enable":          "true",
+		"docknap.subdomain":       "myapp",
+		"docknap.target_port":     "8080",
+		"docknap.idle_timeout":    "15m",
 		"docknap.startup_timeout": "2m",
-		"docknap.theme":          "blue",
-		"docknap.title":          "My App",
-		"docknap.subtitle":       "private",
-		"docknap.icon":           "⚡",
-		"docknap.show_logs":      "false",
-		"docknap.show_stats":     "false",
+		"docknap.theme":           "blue",
+		"docknap.title":           "My App",
+		"docknap.subtitle":        "private",
+		"docknap.icon":            "⚡",
+		"docknap.show_logs":       "false",
+		"docknap.show_stats":      "false",
 	})
 	if !ok {
 		t.Fatal("expected ok=true")
