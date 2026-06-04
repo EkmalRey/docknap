@@ -27,6 +27,7 @@ type Metrics struct {
 	StartDur   *Histogram
 	ProxyDur   *Histogram
 	Registered *Gauge
+	State      *Gauge
 }
 
 type serviceState struct {
@@ -64,11 +65,15 @@ type Docknap struct {
 	rootCancel          context.CancelFunc
 	sessions            *sessionStore
 	rateLimiter         *loginRateLimiter
+	notifier            notifier
+	eventsOK            atomicBool
 
 	states    map[string]*serviceState
 	ipCache   map[string]string
 	ipCacheAt map[string]time.Time
 }
+
+func (s *Docknap) eventsHealthy() bool { return s.eventsOK.get() }
 
 func newDocknap(cli *client.Client, logger *Logger, reg *Registry) *Docknap {
 	m := &Metrics{
@@ -83,6 +88,7 @@ func newDocknap(cli *client.Client, logger *Logger, reg *Registry) *Docknap {
 		ProxyDur: reg.Histogram("docknap_proxy_duration_seconds", "Duration of proxied requests", []string{"subdomain"},
 			[]float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10}),
 		Registered: reg.Gauge("docknap_registered_containers", "Number of registered containers", nil),
+		State:      reg.Gauge("docknap_container_state", "Current container state (1 for active state)", []string{"subdomain", "state"}),
 	}
 	return &Docknap{
 		cli:         cli,
@@ -113,6 +119,26 @@ func (s *Docknap) recordEvent(sub, eventType, message string, fields map[string]
 		hist = hist[len(hist)-maxEventsPerService:]
 	}
 	s.events[sub] = hist
+}
+
+// markBootStart atomically records the boot start time for a service if one
+// is not already set, and returns the (possibly existing) value. Used by
+// handleWait so concurrent waiters see a single, consistent boot origin.
+func (s *Docknap) markBootStart(sub string) time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if t, ok := s.bootStarts[sub]; ok {
+		return t
+	}
+	now := time.Now()
+	s.bootStarts[sub] = now
+	return now
+}
+
+func (s *Docknap) clearBootStart(sub string) {
+	s.mu.Lock()
+	delete(s.bootStarts, sub)
+	s.mu.Unlock()
 }
 
 func (s *Docknap) snapshotServices() (map[string]*Config, map[string]time.Time) {

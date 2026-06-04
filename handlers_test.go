@@ -107,13 +107,24 @@ func TestRateLimitedLoginShowsRateLimitError(t *testing.T) {
 		t.Errorf("first attempt should fail with invalid, got %q", rr.Header().Get("Location"))
 	}
 
+	// Same IP, different port — should still hit the same per-IP bucket.
 	r = httptest.NewRequest("POST", "/_docknap/auth/login", strings.NewReader(form))
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	r.RemoteAddr = "9.9.9.9:2222"
 	rr = httptest.NewRecorder()
 	s.handleLogin(rr, r)
 	if !strings.Contains(rr.Header().Get("Location"), "error=rate_limited") {
-		t.Errorf("second attempt should be rate-limited, got %q", rr.Header().Get("Location"))
+		t.Errorf("second attempt from same IP should be rate-limited, got %q", rr.Header().Get("Location"))
+	}
+
+	// Different IP — should get its own bucket.
+	r = httptest.NewRequest("POST", "/_docknap/auth/login", strings.NewReader(form))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.RemoteAddr = "8.8.8.8:3333"
+	rr = httptest.NewRecorder()
+	s.handleLogin(rr, r)
+	if !strings.Contains(rr.Header().Get("Location"), "error=invalid") {
+		t.Errorf("attempt from different IP should not be rate-limited, got %q", rr.Header().Get("Location"))
 	}
 }
 

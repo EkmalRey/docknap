@@ -10,6 +10,7 @@ func newTestDocknap() *Docknap {
 		idleDefault:         5 * time.Minute,
 		startTimeoutDefault: 60 * time.Second,
 		events:              make(map[string][]Event),
+		notifier:            noopNotifier{},
 	}
 }
 

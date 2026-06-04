@@ -2,6 +2,7 @@ package main
 
 import (
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -20,6 +21,8 @@ type Config struct {
 	LiveLogs       bool
 	HealthPath     string
 	BootMessages   []string
+	DisableIdle    bool
+	Strategy       string
 }
 
 type Theme struct {
@@ -92,27 +95,33 @@ func (s *Docknap) parseLabels(labels map[string]string) (*Config, bool) {
 		LiveLogs:       labels["docknap.live_logs"] == "true",
 		HealthPath:     labels["docknap.health_path"],
 		BootMessages:   splitNonEmpty(boot, "|"),
+		DisableIdle:    labels["docknap.disable_idle"] == "true",
+		Strategy:       parseStrategy(labels["docknap.strategy"]),
 	}, true
+}
+
+func parseStrategy(s string) string {
+	switch s {
+	case "pause":
+		return "pause"
+	default:
+		return "stop"
+	}
 }
 
 func splitNonEmpty(s, sep string) []string {
 	if s == "" {
 		return nil
 	}
-	out := make([]string, 0, 4)
-	cur := ""
-	for _, r := range s {
-		if string(r) == sep {
-			if cur != "" {
-				out = append(out, cur)
-			}
-			cur = ""
-			continue
+	parts := strings.Split(s, sep)
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p != "" {
+			out = append(out, p)
 		}
-		cur += string(r)
 	}
-	if cur != "" {
-		out = append(out, cur)
+	if len(out) == 0 {
+		return nil
 	}
 	return out
 }

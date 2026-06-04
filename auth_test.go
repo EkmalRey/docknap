@@ -31,6 +31,7 @@ func newAuthTestDocknap(t *testing.T) *Docknap {
 		metrics:     reg,
 		sessions:    newSessionStore(12 * time.Hour),
 		rateLimiter: newLoginRateLimiter(5, time.Minute),
+		notifier:    noopNotifier{},
 	}
 	s.m = &Metrics{
 		AuthFail:   reg.Counter("docknap_admin_auth_failures_total", "x", []string{"path", "reason"}),
@@ -42,6 +43,7 @@ func newAuthTestDocknap(t *testing.T) *Docknap {
 		StartDur:   reg.Histogram("docknap_start_duration_seconds", "x", []string{"subdomain"}, []float64{1, 5, 10}),
 		ProxyDur:   reg.Histogram("docknap_proxy_duration_seconds", "x", []string{"subdomain"}, []float64{0.1, 1}),
 		Registered: reg.Gauge("docknap_registered_containers", "x", nil),
+		State:      reg.Gauge("docknap_container_state", "x", []string{"subdomain", "state"}),
 	}
 	userSum := sha256.Sum256([]byte("admin"))
 	s.adminUserHash = userSum[:]
@@ -416,20 +418,27 @@ func TestHandleLogoutRejectsGET(t *testing.T) {
 }
 
 func TestRequestIsHTTPS(t *testing.T) {
-	r := httptest.NewRequest("GET", "/", nil)
-	if requestIsHTTPS(r) {
+	s := newAuthTestDocknap(t)
+	s.trustedProxies = parseTrustedProxies("10.0.0.0/8")
+	mkReq := func() *http.Request {
+		r := httptest.NewRequest("GET", "/", nil)
+		r.RemoteAddr = "10.0.0.5:1234"
+		return r
+	}
+	r := mkReq()
+	if s.requestIsHTTPS(r) {
 		t.Error("plain HTTP request should not be HTTPS")
 	}
 	r.Header.Set("X-Forwarded-Proto", "https")
-	if !requestIsHTTPS(r) {
+	if !s.requestIsHTTPS(r) {
 		t.Error("X-Forwarded-Proto: https should be HTTPS")
 	}
 	r.Header.Set("X-Forwarded-Proto", "HTTPS")
-	if !requestIsHTTPS(r) {
+	if !s.requestIsHTTPS(r) {
 		t.Error("X-Forwarded-Proto: HTTPS (uppercase) should be HTTPS")
 	}
 	r.Header.Set("X-Forwarded-Proto", "http")
-	if requestIsHTTPS(r) {
+	if s.requestIsHTTPS(r) {
 		t.Error("X-Forwarded-Proto: http should not be HTTPS")
 	}
 }

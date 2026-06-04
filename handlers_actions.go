@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -45,7 +44,6 @@ func (s *Docknap) handleStop(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unknown service", http.StatusNotFound)
 		return
 	}
-	s.m.Stops.Add(map[string]string{"subdomain": sub, "reason": "manual"}, 1)
 	s.stopContainerWithReason(cfg, "manual")
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, "stopped: %s\n", cfg.Container)
@@ -65,20 +63,21 @@ func (s *Docknap) handleWakeAll(w http.ResponseWriter, r *http.Request) {
 	s.mu.RUnlock()
 
 	var wg sync.WaitGroup
+	sem := make(chan struct{}, 8)
 	for sub, cfg := range configs {
 		wg.Add(1)
 		go func(sub string, cfg *Config) {
 			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
 			lock := s.acquireStartLock(cfg.Container)
 			lock.Lock()
-			_, portOpen := s.checkPort(context.Background(), cfg)
+			_, portOpen := s.checkPort(s.rootCtx, cfg)
 			lock.Unlock()
 			if portOpen {
 				return
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			if err := s.startContainer(ctx, cfg); err != nil {
+			if err := s.startContainer(s.rootCtx, cfg); err != nil {
 				s.logger.Warn("wake_all: start failed",
 					F("subdomain", sub), F("err", err.Error()))
 			}
@@ -102,16 +101,27 @@ func (s *Docknap) handleStopAll(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.RUnlock()
 
-	count := 0
-	for sub, cfg := range configs {
-		info, err := s.cli.ContainerInspect(r.Context(), cfg.Container)
-		if err != nil || !info.State.Running {
-			continue
-		}
-		count++
-		s.m.Stops.Add(map[string]string{"subdomain": sub, "reason": "manual_all"}, 1)
-		s.stopContainerWithReason(cfg, "manual_all")
+	var count int
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 8)
+	for _, cfg := range configs {
+		wg.Add(1)
+		go func(cfg *Config) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			info, err := s.cli.ContainerInspect(r.Context(), cfg.Container)
+			if err != nil || !info.State.Running {
+				return
+			}
+			s.stopContainerWithReason(cfg, "manual_all")
+			mu.Lock()
+			count++
+			mu.Unlock()
+		}(cfg)
 	}
+	wg.Wait()
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, "stopping %d services\n", count)
 }
@@ -133,17 +143,18 @@ func (s *Docknap) handleWait(w http.ResponseWriter, r *http.Request) {
 
 	_, portOpen := s.checkPort(r.Context(), cfg)
 	if !portOpen {
-		s.mu.Lock()
-		if _, exists := s.bootStarts[sub]; !exists {
-			s.bootStarts[sub] = time.Now()
-			bootStart = s.bootStarts[sub]
-		}
-		s.mu.Unlock()
+		s.markBootStart(sub)
 		if err := s.startContainer(r.Context(), cfg); err != nil {
 			s.logger.Error("start failed (wait)", F("container", cfg.Container), F("err", err.Error()))
 			s.m.StartFail.Add(map[string]string{"subdomain": sub, "reason": "start_error"}, 1)
 		}
 	}
+
+	// Re-read bootStart under the lock so we use the canonical value
+	// regardless of who set it first.
+	s.mu.RLock()
+	bootStart = s.bootStarts[sub]
+	s.mu.RUnlock()
 
 	var elapsed time.Duration
 	switch {
@@ -157,13 +168,13 @@ func (s *Docknap) handleWait(w http.ResponseWriter, r *http.Request) {
 	if timedOut {
 		s.m.StartFail.Add(map[string]string{"subdomain": sub, "reason": "startup_timeout"}, 1)
 		s.recordEvent(sub, "startup_timeout", "startup timeout exceeded", map[string]interface{}{"elapsed_ms": elapsed.Milliseconds(), "timeout_s": int(cfg.StartupTimeout.Seconds())})
+		s.notifier.notify("startup_timeout", sub, cfg.Container, "startup timeout exceeded",
+			map[string]any{"elapsed_ms": elapsed.Milliseconds(), "timeout_s": int(cfg.StartupTimeout.Seconds())})
 		s.logger.Warn("startup timeout", F("subdomain", sub), F("container", cfg.Container), F("elapsed_ms", elapsed.Milliseconds()))
 	}
 
 	if portOpen {
-		s.mu.Lock()
-		delete(s.bootStarts, sub)
-		s.mu.Unlock()
+		s.clearBootStart(sub)
 		s.broadcastReady(sub)
 	}
 

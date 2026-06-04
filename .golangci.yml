@@ -1,0 +1,22 @@
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  disable-all: true
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - gosec
+    - goimports
+
+issues:
+  exclude-rules:
+    - path: _test\.go
+      linters: [gosec, errcheck]
+    # docker.go and proxy.go are third-party-style HTTP plumbing
+    - linters: [errcheck]
+      text: "Error return value of `.*Write` is not checked"

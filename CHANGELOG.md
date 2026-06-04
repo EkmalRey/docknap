@@ -5,6 +5,32 @@ All notable changes to docknap will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-06-04
+
+### Added
+- **CSRF protection** for all state-changing admin endpoints (`/_docknap/wake/`, `/_docknap/stop/`, `/_docknap/wake_all`, `/_docknap/stop_all`, `/_docknap/auth/logout`). A `docknap_csrf` cookie (`HttpOnly=false`) is set at login in addition to the session cookie. The admin UI sends the token as an `X-CSRF-Token` header on POSTs and the logout form embeds it as a hidden field. The check is skipped for `Authorization: Basic` requests (since the header is already an effective CSRF defense).
+- **`docknap.disable_idle` label** — when `true`, docknap never auto-stops the container on idle. Useful for long-running services you want to keep up.
+- **`docknap.strategy=pause` label** — when set, docknap calls `ContainerPause` / `ContainerUnpause` instead of `ContainerStop` / `ContainerStart`. The container stays on the network, so `docknap.health_path` is required (a plain TCP dial would falsely report "ready" against a frozen cgroup). Wakes become sub-second.
+- **Webhooks** via `DOCKNAP_WEBHOOK_URL` and `DOCKNAP_WEBHOOK_EVENTS`. Lifecycle events (`start_requested`, `ready`, `idle_stop`, `stopped`, `paused`, `start_error`, `startup_timeout`, `disappeared`) are queued and POSTed to the configured URL as JSON. Best-effort, with a 3s per-request timeout. Filter with `DOCKNAP_WEBHOOK_EVENTS=ready,stopped`.
+- **`/_docknap/version`** — JSON `{"version", "go_version"}` for ops/CI checks. No auth.
+- **`/_docknap/readyz`** — readiness probe. 200 when the docker events stream is healthy, 503 when the polling fallback is in use. Use for k8s/Compose `readinessProbe`.
+- **`/_docknap/debug/pprof/`** — Go pprof endpoints (heap, goroutine, allocs, profile, trace, ...). Auth-gated. Use for production debugging.
+- **`/healthz` start-period** bumped from 5s to 10s to match the cold-start discover pass.
+
+### Changed
+- **`getContainerIP` no longer falls through to other networks.** Previously, if a container wasn't attached to `DOCKNAP_NETWORK` it would silently return the IP of a different network. Now it returns an explicit error, so a misconfigured container surfaces as "service unavailable" instead of being routed to the wrong IP.
+- **HTTP health probe (`docknap.health_path`) does not follow redirects.** A slow redirect chain can no longer blow the 1s readiness budget.
+- **`refreshStateGauges` is a pure read** of the watch-loop's state cache. Prometheus scrapes no longer trigger per-service `ContainerInspect` calls.
+- **Login rate limiter keys on the real client IP** when behind a trusted proxy (reads `X-Forwarded-For`). Without a trusted proxy, the header is ignored to prevent spoofing.
+- **Image now runs as a non-root user** (`docknap` uid). The `docknap` user has no shell and no home.
+- **`handleWakeAll` and `handleStopAll` use bounded concurrency** (8 in flight) and `s.rootCtx` (no per-call 5s timeout) so a slow start doesn't fail the whole bulk action.
+- **Test helpers and `golangci-lint`** added to CI.
+- **Removed dead code:** `netSplitHostPort`, `requestIsHTTPSRaw`, `_ = e` in `subscribeDockerEvents`, `var _ = fmt.Sprintf` in main.
+
+### Fixed
+- **`docknap_container_stops_total` is no longer double-counted** for manual and `manual_all` stops. The endpoint handler used to increment the counter and then call `stopContainerWithReason`, which also incremented. Idle stops were unaffected.
+- **`splitNonEmpty` no longer allocates per rune.** Uses `strings.Split` + filter.
+
 ## [0.2.0] - 2026-06-04
 
 ### Changed

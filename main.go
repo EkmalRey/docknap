@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -46,6 +45,13 @@ func main() {
 	s.writeTimeout = parseDurationOr("DOCKNAP_WRITE_TIMEOUT", 60*time.Second)
 	s.trustedProxies = parseTrustedProxies(os.Getenv("DOCKNAP_TRUSTED_PROXIES"))
 
+	if w := loadWebhookConfig(os.Getenv("DOCKNAP_WEBHOOK_URL"), os.Getenv("DOCKNAP_WEBHOOK_EVENTS")); w != nil {
+		s.notifier = w
+		logger.Info("webhooks enabled", F("url", os.Getenv("DOCKNAP_WEBHOOK_URL")))
+	} else {
+		s.notifier = noopNotifier{}
+	}
+
 	adminUser := os.Getenv("DOCKNAP_ADMIN_USER")
 	adminPass := os.Getenv("DOCKNAP_ADMIN_PASS")
 	if (adminUser == "") != (adminPass == "") {
@@ -84,20 +90,23 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/_docknap/auth/login", s.handleLogin)
-	mux.HandleFunc("/_docknap/auth/logout", s.handleLogout)
+	mux.HandleFunc("/_docknap/auth/logout", s.requireAuth(s.requireCSRF(s.handleLogout)))
 	mux.HandleFunc("/_docknap", s.requireAuth(s.handleAdmin))
 	mux.HandleFunc("/_docknap/", s.requireAuth(s.handleAdmin))
 	mux.HandleFunc("/_docknap/status", s.requireAuth(s.handleStatus))
 	mux.HandleFunc("/_docknap/config", s.requireAuth(s.handleConfig))
 	mux.HandleFunc("/_docknap/wait/", s.handleWait)
-	mux.HandleFunc("/_docknap/wake/", s.requireAuth(s.handleWake))
-	mux.HandleFunc("/_docknap/stop/", s.requireAuth(s.handleStop))
-	mux.HandleFunc("/_docknap/wake_all", s.requireAuth(s.handleWakeAll))
-	mux.HandleFunc("/_docknap/stop_all", s.requireAuth(s.handleStopAll))
+	mux.HandleFunc("/_docknap/wake/", s.requireAuth(s.requireCSRF(s.handleWake)))
+	mux.HandleFunc("/_docknap/stop/", s.requireAuth(s.requireCSRF(s.handleStop)))
+	mux.HandleFunc("/_docknap/wake_all", s.requireAuth(s.requireCSRF(s.handleWakeAll)))
+	mux.HandleFunc("/_docknap/stop_all", s.requireAuth(s.requireCSRF(s.handleStopAll)))
 	mux.HandleFunc("/_docknap/metrics", s.requireAuth(s.handleMetrics))
 	mux.HandleFunc("/_docknap/metrics/", s.requireAuth(s.handleServiceMetrics))
 	mux.HandleFunc("/_docknap/history/", s.requireAuth(s.handleServiceHistory))
 	mux.HandleFunc("/_docknap/logs/", s.requireAuth(s.handleLogs))
+	mux.HandleFunc("/_docknap/readyz", s.requireAuth(s.handleReadyz))
+	mux.HandleFunc("/_docknap/version", s.handleVersion)
+	mux.HandleFunc("/_docknap/debug/pprof/", s.requireAuth(s.handlePprof))
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/", s.handleProxy)
 
@@ -112,7 +121,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              s.listenAddr,
-		Handler:           mux,
+		Handler:           recoverMiddleware(mux),
 		ReadTimeout:       30 * time.Second,
 		ReadHeaderTimeout: 10 * time.Second,
 		WriteTimeout:      s.writeTimeout,
@@ -142,6 +151,7 @@ func main() {
 		s.rootCancel()
 		s.stopAllIdleTimers()
 		globalLogTailer.stopAll()
+		s.notifier.shutdown()
 		logger.Info("shutdown complete")
 	}
 }
@@ -196,5 +206,3 @@ func parseDurationOr(key string, fallback time.Duration) time.Duration {
 	}
 	return fallback
 }
-
-var _ = fmt.Sprintf

@@ -62,7 +62,3 @@ func (s *Docknap) trustedProxy(r *http.Request) bool {
 	}
 	return false
 }
-
-func netSplitHostPort(s string) (host, port string, err error) {
-	return net.SplitHostPort(s)
-}

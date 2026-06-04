@@ -8,21 +8,18 @@ import (
 	"time"
 )
 
-func (s *Docknap) refreshStateGauges(ctx context.Context) {
+func (s *Docknap) refreshStateGauges(_ context.Context) {
 	s.mu.RLock()
-	configs := make(map[string]*Config, len(s.configs))
-	for k, v := range s.configs {
-		configs[k] = v
+	states := make(map[string]string, len(s.states))
+	for sub, st := range s.states {
+		states[sub] = st.State
 	}
 	s.mu.RUnlock()
-	for sub, cfg := range configs {
-		info, err := s.cli.ContainerInspect(ctx, cfg.Container)
-		state := "missing"
-		if err == nil {
-			state = info.State.Status
+	for sub, state := range states {
+		if state == "" {
+			state = "unknown"
 		}
-		s.metrics.Gauge("docknap_container_state", "Current container state (1 for active state)",
-			[]string{"subdomain", "state"}).Set(map[string]string{"subdomain": sub, "state": state}, 1)
+		s.m.State.Set(map[string]string{"subdomain": sub, "state": state}, 1)
 	}
 }
 

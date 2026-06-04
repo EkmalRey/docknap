@@ -5,6 +5,7 @@
 <title>docknap // admin</title>
 <meta name="robots" content="noindex,nofollow">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="csrf-token" content="{{.CSRFToken}}">
 <style>
   :root {
     --bg: #0a0e14;
@@ -91,6 +92,7 @@
       <button class="btn stop" id="btn-stop-all" title="stop every running service">stop all</button>
     </div>
     <form class="logout-form" method="POST" action="/_docknap/auth/logout">
+      <input type="hidden" name="csrf" value="{{.CSRFToken}}">
       <button class="logout-btn" type="submit" title="clear session cookie">logout</button>
     </form>
   </div>
@@ -116,6 +118,7 @@ const rows = document.getElementById('rows');
 const statReg = document.getElementById('stat-reg');
 const statRun = document.getElementById('stat-run');
 const toast = document.getElementById('toast');
+const csrfToken = document.querySelector('meta[name="csrf-token"]').content;
 
 let toastTimer = null;
 function showToast(msg, kind) {
@@ -174,7 +177,7 @@ async function refresh() {
 }
 
 async function act(path, method) {
-  const res = await fetch(path, { method });
+  const res = await fetch(path, { method, headers: { 'X-CSRF-Token': csrfToken } });
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || ('HTTP ' + res.status));
@@ -201,7 +204,7 @@ document.getElementById('btn-wake-all').addEventListener('click', async (e) => {
   const btn = e.target;
   btn.disabled = true;
   try {
-    const res = await fetch('/_docknap/wake_all', { method: 'POST' });
+    const res = await fetch('/_docknap/wake_all', { method: 'POST', headers: { 'X-CSRF-Token': csrfToken } });
     if (!res.ok) throw new Error(await res.text());
     showToast('waking all stopped services', 'ok');
     setTimeout(refresh, 500);
@@ -215,7 +218,7 @@ document.getElementById('btn-stop-all').addEventListener('click', async (e) => {
   const btn = e.target;
   btn.disabled = true;
   try {
-    const res = await fetch('/_docknap/stop_all', { method: 'POST' });
+    const res = await fetch('/_docknap/stop_all', { method: 'POST', headers: { 'X-CSRF-Token': csrfToken } });
     if (!res.ok) throw new Error(await res.text());
     showToast('stopping all running services', 'ok');
     setTimeout(refresh, 500);

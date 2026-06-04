@@ -14,6 +14,7 @@ func newArmTestDocknap() *Docknap {
 		startedAt:  make(map[string]time.Time),
 		events:     make(map[string][]Event),
 		startLocks: make(map[string]*sync.Mutex),
+		notifier:   noopNotifier{},
 	}
 }
 

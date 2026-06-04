@@ -7,6 +7,8 @@ services:
       - "docknap.subdomain=demo"
       - "docknap.target_port=80"
       - "docknap.idle_timeout=10m"
+      - "docknap.startup_timeout=30s"
+      - "docknap.health_path=/"
       - "docknap.title=Demo Nginx"
       - "docknap.theme=blue"
     networks:

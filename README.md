@@ -59,6 +59,8 @@ Add labels to any container you want to be lazy-loaded, attach it to `docknap_ne
 | `docknap.show_stats` | no | `true` | Show elapsed time and timeout footer |
 | `docknap.boot_messages` | no | five fixed lines | Pipe-separated boot messages shown in the loading-page log (cosmetic). |
 | `docknap.live_logs` | no | `false` | If `true`, `/_docknap/logs/<sub>` exposes a live SSE stream of the container's stdout+stderr. Off by default — opt in per service. |
+| `docknap.disable_idle` | no | `false` | If `true`, docknap will never auto-stop the container on idle. Use for long-running services you want to keep up (e.g. dev DBs). |
+| `docknap.strategy` | no | `stop` | `stop` (default) or `pause`. With `pause`, docknap calls `ContainerPause` / `ContainerUnpause` instead of `ContainerStop` / `ContainerStart`. The container stays attached to the network, so `docknap.health_path` is required (a plain TCP dial would falsely report "ready" against a frozen cgroup). |
 
 ## Environment variables
 
@@ -75,6 +77,8 @@ Add labels to any container you want to be lazy-loaded, attach it to `docknap_ne
 | `DOCKNAP_ADMIN_HOST` | (unset) | If set, the admin UI is served at the root of this hostname (e.g. `https://docknap.internal/`). Other hostnames are unaffected. |
 | `DOCKNAP_ADMIN_USER` | (unset) | If set with `DOCKNAP_ADMIN_PASS`, requires auth for all `/_docknap/*` endpoints except `/_docknap/wait/` (used by the loading page) |
 | `DOCKNAP_ADMIN_PASS` | (unset) | Password for admin auth (must be set with `DOCKNAP_ADMIN_USER`) |
+| `DOCKNAP_WEBHOOK_URL` | (unset) | If set, docknap POSTs lifecycle events (`start_requested`, `ready`, `idle_stop`, `stopped`, `paused`, `start_error`, `startup_timeout`, `disappeared`) to this URL as JSON. Requires `docknap.enable=true` containers only — events fire from the docknap-side lifecycle, not container-level. |
+| `DOCKNAP_WEBHOOK_EVENTS` | (unset) | Comma-separated whitelist of event types to send. When unset, all known events are sent. |
 
 ## Network setup
 
@@ -191,6 +195,9 @@ The cosmetic boot log is a fixed set of staged messages, not a live tail of the 
 | `GET /_docknap/metrics/<subdomain>` | Prometheus metrics filtered to one service |
 | `GET /_docknap/history/<subdomain>` | JSON with current state, event counts, last 100 events, and startup-duration stats |
 | `GET /healthz` | Liveness probe (always 200 OK, no auth) |
+| `GET /_docknap/version` | Build version + Go runtime version (no auth) |
+| `GET /_docknap/readyz` | Readiness probe (200 when docker events stream is healthy, 503 when polling fallback is in use; requires auth) |
+| `GET /_docknap/debug/pprof/` | Go pprof (heap, goroutine, allocs, profile, etc.; requires auth) |
 
 If `DOCKNAP_ADMIN_HOST` is set, the admin UI is also served at the root of that host (e.g. `https://docknap.internal/`). On other hostnames, the root path is the normal proxy.
 
@@ -223,7 +230,30 @@ When enabled, all `/_docknap/*` endpoints require auth **except `/_docknap/wait/
 
 Passwords are stored as SHA-256 hashes in memory and compared with constant-time equality. The session cookie contains only an opaque token, not the password.
 
+All state-changing endpoints (`/_docknap/wake/`, `/_docknap/stop/`, `/_docknap/wake_all`, `/_docknap/stop_all`, `/_docknap/auth/logout`) require a CSRF token. A second cookie `docknap_csrf` is set at login (value matches the session token, `HttpOnly=false` so the admin UI can read it via JS). The admin UI sends it as an `X-CSRF-Token` header on all `POST`s, and the logout form embeds it as a hidden field. The CSRF check is skipped for non-`POST` requests and for requests that authenticate with `Authorization: Basic` (since the header is already an effective CSRF defense — an attacker cannot forge a cross-origin request with the user's credentials).
+
 > **Security:** HTTP Basic Auth and the login-cookie flow both send credentials base64-encoded over the wire, not encrypted. **Always run docknap behind a TLS-terminating reverse proxy.** docknap will log a warning at startup if no admin credentials are configured.
+
+## Webhooks
+
+When `DOCKNAP_WEBHOOK_URL` is set, docknap POSTs lifecycle events to that URL. The body is JSON:
+
+```json
+{
+  "event": "ready",
+  "subdomain": "openwebui",
+  "container": "open-webui-1",
+  "message": "container port is accepting connections",
+  "fields": {"elapsed_ms": 10500, "ip": "172.20.0.5"},
+  "time": "2026-06-04T13:09:42.123Z"
+}
+```
+
+Event types: `start_requested`, `ready`, `idle_stop`, `stopped`, `paused` (only with `docknap.strategy=pause`), `start_error`, `startup_timeout`, `disappeared`.
+
+A single worker drains the queue; events are best-effort and dropped (with a debug log) if the queue is full or the target returns a non-2xx status. The 3-second per-request timeout keeps a slow webhook receiver from blocking the lifecycle.
+
+Filter events with `DOCKNAP_WEBHOOK_EVENTS=ready,stopped,startup_timeout`.
 
 ## Security
 

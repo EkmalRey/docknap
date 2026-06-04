@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -13,6 +14,9 @@ import (
 const (
 	authRealm        = "docknap"
 	authCookieName   = "docknap_auth"
+	csrfCookieName   = "docknap_csrf"
+	csrfHeaderName   = "X-CSRF-Token"
+	csrfFormField    = "csrf"
 	authCookieMaxAge = 12 * time.Hour
 	loginPath        = "/_docknap/auth/login"
 	logoutPath       = "/_docknap/auth/logout"
@@ -50,6 +54,40 @@ func (s *Docknap) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		s.serveLogin(w, r, "")
+	}
+}
+
+func (s *Docknap) requireCSRF(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.authEnabled() || r.Method != http.MethodPost {
+			next(w, r)
+			return
+		}
+		// Only enforce CSRF when a session-cookie login is in use. Basic-auth
+		// requests are authenticated by the Authorization header, which an
+		// attacker cannot forge cross-origin.
+		if r.Header.Get("Authorization") != "" {
+			next(w, r)
+			return
+		}
+		cookie, err := r.Cookie(csrfCookieName)
+		if err != nil || cookie.Value == "" {
+			s.logger.Warn("csrf rejected: missing token",
+				F("path", r.URL.Path), F("remote", r.RemoteAddr))
+			http.Error(w, "csrf token missing", http.StatusForbidden)
+			return
+		}
+		headerToken := r.Header.Get(csrfHeaderName)
+		if headerToken == "" {
+			headerToken = r.PostFormValue(csrfFormField)
+		}
+		if subtle.ConstantTimeCompare([]byte(cookie.Value), []byte(headerToken)) != 1 {
+			s.logger.Warn("csrf rejected: token mismatch",
+				F("path", r.URL.Path), F("remote", r.RemoteAddr))
+			http.Error(w, "csrf token invalid", http.StatusForbidden)
+			return
+		}
+		next(w, r)
 	}
 }
 
@@ -112,7 +150,7 @@ func (s *Docknap) handleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Docknap) processLogin(w http.ResponseWriter, r *http.Request) {
-	remoteKey := clientKey(r)
+	remoteKey := s.clientKey(r)
 	if !s.rateLimiter.allow(remoteKey) {
 		s.m.AuthFail.Add(map[string]string{"path": r.URL.Path, "reason": "rate_limited"}, 1)
 		s.logger.Warn("login rate-limited", F("remote", r.RemoteAddr))
@@ -158,6 +196,15 @@ func (s *Docknap) processLogin(w http.ResponseWriter, r *http.Request) {
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   int(authCookieMaxAge.Seconds()),
 	})
+	http.SetCookie(w, &http.Cookie{
+		Name:     csrfCookieName,
+		Value:    tok,
+		Path:     "/",
+		HttpOnly: false,
+		Secure:   s.requestIsHTTPS(r),
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   int(authCookieMaxAge.Seconds()),
+	})
 	s.logger.Info("admin login",
 		F("user", user),
 		F("remote", r.RemoteAddr),
@@ -166,16 +213,19 @@ func (s *Docknap) processLogin(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, safeRedirect(next, "/_docknap/"), http.StatusFound)
 }
 
-func clientKey(r *http.Request) string {
-	host, _, err := splitHostPort(r.RemoteAddr)
+func (s *Docknap) clientKey(r *http.Request) string {
+	if s.trustedProxy(r) {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			if first := strings.TrimSpace(strings.Split(xff, ",")[0]); first != "" {
+				return first
+			}
+		}
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		host = r.RemoteAddr
 	}
 	return host
-}
-
-func splitHostPort(s string) (host, port string, err error) {
-	return netSplitHostPort(s)
 }
 
 func (s *Docknap) failLogin(w http.ResponseWriter, r *http.Request, next, errCode string) {
@@ -205,6 +255,15 @@ func (s *Docknap) handleLogout(w http.ResponseWriter, r *http.Request) {
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   -1,
 	})
+	http.SetCookie(w, &http.Cookie{
+		Name:     csrfCookieName,
+		Value:    "",
+		Path:     "/",
+		HttpOnly: false,
+		Secure:   s.requestIsHTTPS(r),
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   -1,
+	})
 	http.Redirect(w, r, loginPath, http.StatusFound)
 }
 
@@ -214,15 +273,6 @@ func (s *Docknap) requestIsHTTPS(r *http.Request) bool {
 	}
 	if !s.trustedProxy(r) {
 		return false
-	}
-	return strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
-}
-
-// requestIsHTTPSRaw is a free-function variant used by tests; it does not
-// honor DOCKNAP_TRUSTED_PROXIES. Use s.requestIsHTTPS in handler code.
-func requestIsHTTPS(r *http.Request) bool {
-	if r.TLS != nil {
-		return true
 	}
 	return strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
 }

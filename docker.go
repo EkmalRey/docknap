@@ -59,10 +59,12 @@ func (s *Docknap) discover(ctx context.Context) error {
 
 func (s *Docknap) watch(ctx context.Context) {
 	if err := s.subscribeDockerEvents(ctx); err == nil {
+		s.eventsOK.set(true)
 		s.logger.Info("watching docker events", F("source", "events"))
 		<-ctx.Done()
 		return
 	} else {
+		s.eventsOK.set(false)
 		s.logger.Warn("docker events subscription failed, falling back to poll",
 			F("err", err.Error()))
 	}
@@ -107,7 +109,6 @@ func (s *Docknap) subscribeDockerEvents(ctx context.Context) error {
 					return
 				}
 				s.logger.Debug("docker event", F("action", e.Action), F("name", e.Actor.Attributes["name"]))
-				_ = e
 				debounce = time.After(500 * time.Millisecond)
 			case <-debounce:
 				s.syncContainers(ctx)
@@ -116,6 +117,7 @@ func (s *Docknap) subscribeDockerEvents(ctx context.Context) error {
 				s.syncContainers(ctx)
 			case err := <-errCh:
 				if err != nil {
+					s.eventsOK.set(false)
 					s.logger.Warn("docker events stream error, falling back to poll", F("err", err.Error()))
 					go s.watchPoll(ctx)
 					return
@@ -153,6 +155,7 @@ func (s *Docknap) syncContainers(ctx context.Context) {
 	for name, cfg := range known {
 		if !found[name] {
 			s.logger.Info("container disappeared", F("container", name), F("subdomain", cfg.Subdomain))
+			s.notifier.notify("disappeared", cfg.Subdomain, name, "container no longer present in registry", nil)
 			delete(s.configs, cfg.Subdomain)
 			if t, ok := s.idleTimers[name]; ok {
 				t.Stop()
@@ -216,21 +219,26 @@ func (s *Docknap) getContainerIP(ctx context.Context, name string) (string, erro
 	if err != nil {
 		return "", err
 	}
-	if n, ok := info.NetworkSettings.Networks[s.networkName]; ok && n.IPAddress != "" {
-		return n.IPAddress, nil
+	n, ok := info.NetworkSettings.Networks[s.networkName]
+	if !ok || n.IPAddress == "" {
+		return "", fmt.Errorf("container %s not attached to network %s", name, s.networkName)
 	}
-	for _, n := range info.NetworkSettings.Networks {
-		if n.IPAddress != "" {
-			return n.IPAddress, nil
-		}
-	}
-	return "", nil
+	return n.IPAddress, nil
 }
 
 func (s *Docknap) checkPort(ctx context.Context, cfg *Config) (string, bool) {
 	ip, err := s.getContainerIP(ctx, cfg.Container)
 	if err != nil || ip == "" {
 		return "", false
+	}
+	// Pause strategy: TCP sockets stay open while the cgroup is frozen, so a
+	// plain dial would falsely report "ready". Require an HTTP health probe
+	// (i.e. the user must set docknap.health_path) and fall back to "not
+	// ready" if it isn't configured.
+	if cfg.Strategy == "pause" && cfg.HealthPath == "" {
+		s.logger.Warn("pause strategy requires docknap.health_path label; treating as not ready",
+			F("subdomain", cfg.Subdomain), F("container", cfg.Container))
+		return ip, false
 	}
 	if cfg.HealthPath != "" {
 		return s.checkHTTPHealth(ctx, ip, cfg)
@@ -254,7 +262,12 @@ func (s *Docknap) checkHTTPHealth(ctx context.Context, ip string, cfg *Config) (
 	if err != nil {
 		return ip, false
 	}
-	cli := &http.Client{Timeout: 1 * time.Second}
+	cli := &http.Client{
+		Timeout: 1 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 	resp, err := cli.Do(req)
 	if err != nil {
 		return ip, false
@@ -286,22 +299,31 @@ func (s *Docknap) startContainer(ctx context.Context, cfg *Config) error {
 	if err != nil {
 		return fmt.Errorf("inspect: %w", err)
 	}
-	if info.State.Running {
+	// For pause strategy, the container is "running" but paused; treat that
+	// as not-ready so waitForReady kicks in.
+	if info.State.Running && !(cfg.Strategy == "pause" && info.State.Paused) {
 		return nil
 	}
 	s.m.Starts.Add(map[string]string{"subdomain": cfg.Subdomain}, 1)
 	s.recordEvent(cfg.Subdomain, "start_requested", "container start requested", nil)
-	s.mu.Lock()
-	s.bootStarts[cfg.Subdomain] = time.Now()
-	s.mu.Unlock()
+	s.notifier.notify("start_requested", cfg.Subdomain, cfg.Container, "container start requested", nil)
+	s.markBootStart(cfg.Subdomain)
 	s.logger.Info("starting container", F("subdomain", cfg.Subdomain), F("container", cfg.Container))
 	bootStart := time.Now()
-	if err := s.cli.ContainerStart(ctx, cfg.Container, container.StartOptions{}); err != nil {
-		s.mu.Lock()
-		delete(s.bootStarts, cfg.Subdomain)
-		s.mu.Unlock()
-		s.recordEvent(cfg.Subdomain, "start_error", err.Error(), nil)
-		return err
+	if cfg.Strategy == "pause" && info.State.Paused {
+		if err := s.cli.ContainerUnpause(ctx, cfg.Container); err != nil {
+			s.clearBootStart(cfg.Subdomain)
+			s.recordEvent(cfg.Subdomain, "start_error", err.Error(), nil)
+			s.notifier.notify("start_error", cfg.Subdomain, cfg.Container, err.Error(), nil)
+			return err
+		}
+	} else {
+		if err := s.cli.ContainerStart(ctx, cfg.Container, container.StartOptions{}); err != nil {
+			s.clearBootStart(cfg.Subdomain)
+			s.recordEvent(cfg.Subdomain, "start_error", err.Error(), nil)
+			s.notifier.notify("start_error", cfg.Subdomain, cfg.Container, err.Error(), nil)
+			return err
+		}
 	}
 
 	go s.waitForReady(cfg, bootStart)
@@ -332,6 +354,8 @@ func (s *Docknap) waitForReady(cfg *Config, bootStart time.Time) {
 			s.mu.Unlock()
 			s.recordEvent(cfg.Subdomain, "ready", "container port is accepting connections",
 				map[string]interface{}{"elapsed_ms": elapsed.Milliseconds(), "ip": ip})
+			s.notifier.notify("ready", cfg.Subdomain, cfg.Container, "container port is accepting connections",
+				map[string]any{"elapsed_ms": elapsed.Milliseconds(), "ip": ip})
 			s.logger.Info("container ready",
 				F("subdomain", cfg.Subdomain),
 				F("container", cfg.Container),

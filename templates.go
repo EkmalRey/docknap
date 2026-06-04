@@ -101,6 +101,7 @@ func bootJSON(boot []string) string {
 
 type adminData struct {
 	DocknapVersion string
+	CSRFToken      string
 }
 
 type loginData struct {
@@ -116,7 +117,10 @@ func (s *Docknap) renderAdmin(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
-	_ = templates.ExecuteTemplate(w, "admin.html", adminData{DocknapVersion: version})
+	_ = templates.ExecuteTemplate(w, "admin.html", adminData{
+		DocknapVersion: version,
+		CSRFToken:      s.renderAdminCtx(w, r),
+	})
 }
 
 func (s *Docknap) renderLogin(w http.ResponseWriter, r *http.Request, errCode, next string) {
