@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"os"
 	"strings"
 )
 
@@ -12,12 +11,12 @@ type cidr struct {
 	net *net.IPNet
 }
 
-func parseTrustedProxies(env string) []*cidr {
+func parseTrustedProxies(env string) ([]cidr, error) {
 	env = strings.TrimSpace(env)
 	if env == "" {
-		return nil
+		return nil, nil
 	}
-	var out []*cidr
+	var out []cidr
 	for _, raw := range strings.Split(env, ",") {
 		raw = strings.TrimSpace(raw)
 		if raw == "" {
@@ -28,18 +27,14 @@ func parseTrustedProxies(env string) []*cidr {
 		}
 		_, n, err := net.ParseCIDR(raw)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "docknap: ignoring invalid DOCKNAP_TRUSTED_PROXIES entry %q: %v\n", raw, err)
-			continue
+			return nil, fmt.Errorf("invalid DOCKNAP_TRUSTED_PROXIES entry %q: %v", raw, err)
 		}
-		out = append(out, &cidr{net: n})
+		out = append(out, cidr{net: n})
 	}
-	return out
+	return out, nil
 }
 
-func (c *cidr) contains(ip net.IP) bool {
-	if c == nil {
-		return false
-	}
+func (c cidr) contains(ip net.IP) bool {
 	return c.net.Contains(ip)
 }
 

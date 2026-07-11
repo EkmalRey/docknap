@@ -11,4 +11,4 @@ type notifier interface {
 type noopNotifier struct{}
 
 func (noopNotifier) notify(string, string, string, string, map[string]any) {}
-func (noopNotifier) shutdown()                                            {}
+func (noopNotifier) shutdown()                                             {}

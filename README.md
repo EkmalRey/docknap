@@ -2,7 +2,7 @@
 
 **A lazy-loading reverse proxy for Docker containers.** Put it in front of your rarely-used services and they stay off until someone actually requests them.
 
-[![build](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/ekmalrey/docknap/actions)
+[![build](https://github.com/EkmalRey/docknap/actions/workflows/build.yml/badge.svg)](https://github.com/EkmalRey/docknap/actions/workflows/build.yml)
 [![release](https://img.shields.io/github/v/release/ekmalrey/docknap)](https://github.com/ekmalrey/docknap/releases)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![image](https://img.shields.io/badge/image-ghcr.io%2Fekmalrey%2Fdocknap-blue)](https://github.com/ekmalrey/docknap/pkgs/container/docknap)
@@ -31,15 +31,36 @@
 # 1. Create the network (once)
 docker network create docknap_network
 
-# 2. Run docknap
+# 2. Run docknap. The image runs as an unprivileged user, but /var/run/docker.sock
+#    is normally root:docker 0660, so run as root (user 0:0) OR pass the docker
+#    group GID via --group-add. Otherwise discovery fails with permission denied.
 docker run -d --name docknap \
-  -p 8000:8000 \
+  -p 127.0.0.1:8000:8000 \
   -v /var/run/docker.sock:/var/run/docker.sock \
+  -e DOCKNAP_ADMIN_USER=admin \
+  -e DOCKNAP_ADMIN_PASS=your-secret-here \
+  --user "0:0" \
   --network docknap_network \
   ghcr.io/ekmalrey/docknap:latest
 ```
 
-Add labels to any container you want to be lazy-loaded, attach it to `docknap_network`, and start it. Now hitting `http://<container-ip>:port` (via a reverse proxy) will trigger a start.
+Start a labeled target on the same network and trigger a lazy start through
+docknap (not by hitting the container IP directly — that bypasses docknap):
+
+```bash
+docker run -d --name demo \
+  --network docknap_network \
+  -l docknap.enable=true \
+  -l docknap.subdomain=demo \
+  -l docknap.target_port=80 \
+  nginx:alpine
+
+# First request wakes the container and serves the loading page, then the app:
+curl -H 'Host: demo.internal' http://localhost:8000/
+```
+
+See [`docker-compose.example.yml`](docker-compose.example.yml) for a full
+deployment, including a `user: "0:0"` socket-permission fix and admin auth.
 
 ## Container labels
 
@@ -196,7 +217,7 @@ The cosmetic boot log is a fixed set of staged messages, not a live tail of the 
 | `GET /_docknap/history/<subdomain>` | JSON with current state, event counts, last 100 events, and startup-duration stats |
 | `GET /healthz` | Liveness probe (always 200 OK, no auth) |
 | `GET /_docknap/version` | Build version + Go runtime version (no auth) |
-| `GET /_docknap/readyz` | Readiness probe (200 when docker events stream is healthy, 503 when polling fallback is in use; requires auth) |
+| `GET /_docknap/readyz` | Readiness probe (200 once container state has synced at least once via the Docker event stream or poll fallback; 503/degraded before first successful sync or while a poll re-sync is failing; requires auth) |
 | `GET /_docknap/debug/pprof/` | Go pprof (heap, goroutine, allocs, profile, etc.; requires auth) |
 
 If `DOCKNAP_ADMIN_HOST` is set, the admin UI is also served at the root of that host (e.g. `https://docknap.internal/`). On other hostnames, the root path is the normal proxy.
@@ -230,7 +251,7 @@ When enabled, all `/_docknap/*` endpoints require auth **except `/_docknap/wait/
 
 Passwords are stored as SHA-256 hashes in memory and compared with constant-time equality. The session cookie contains only an opaque token, not the password.
 
-All state-changing endpoints (`/_docknap/wake/`, `/_docknap/stop/`, `/_docknap/wake_all`, `/_docknap/stop_all`, `/_docknap/auth/logout`) require a CSRF token. A second cookie `docknap_csrf` is set at login (value matches the session token, `HttpOnly=false` so the admin UI can read it via JS). The admin UI sends it as an `X-CSRF-Token` header on all `POST`s, and the logout form embeds it as a hidden field. The CSRF check is skipped for non-`POST` requests and for requests that authenticate with `Authorization: Basic` (since the header is already an effective CSRF defense — an attacker cannot forge a cross-origin request with the user's credentials).
+All state-changing endpoints (`/_docknap/wake/`, `/_docknap/stop/`, `/_docknap/wake_all`, `/_docknap/stop_all`, `/_docknap/auth/logout`) require a CSRF token. A second cookie `docknap_csrf` is set at login (value matches the session token, `HttpOnly=false` so the admin UI can read it via JS). The admin UI sends it as an `X-CSRF-Token` header on all `POST`s, and the logout form embeds it as a hidden field. The synchronizer-token check is skipped for non-`POST` requests and for requests authenticated with `Authorization: Basic`. Basic-authenticated browser requests must still pass Fetch Metadata and same-origin `Origin` checks.
 
 > **Security:** HTTP Basic Auth and the login-cookie flow both send credentials base64-encoded over the wire, not encrypted. **Always run docknap behind a TLS-terminating reverse proxy.** docknap will log a warning at startup if no admin credentials are configured.
 
@@ -264,8 +285,8 @@ Recommendations:
 - Always run docknap behind a TLS-terminating reverse proxy (Caddy, nginx, Traefik).
 - Set `DOCKNAP_ADMIN_USER` and `DOCKNAP_ADMIN_PASS` if the port is exposed beyond localhost. docknap will emit a warning at startup if these are unset.
 - Bind docknap's port to a trusted network only (e.g. a private Docker network, not `0.0.0.0` on a public host).
-- Set `DOCKNAP_TRUSTED_PROXIES` to the CIDR of the TLS-terminating reverse proxy so docknap trusts `X-Forwarded-Proto` only from it.
-- Use a dedicated, low-privilege user account for the Docker socket where the engine supports it.
+- Set `DOCKNAP_TRUSTED_PROXIES` to the CIDR of the TLS-terminating reverse proxy. Configure that proxy to overwrite, not append to, client-supplied `X-Forwarded-For` and `X-Forwarded-Proto` headers.
+- Prefer rootless Docker or a restricted socket proxy. Direct Docker socket access, including Docker-group membership, is host-root-equivalent.
 - Rotate `DOCKNAP_ADMIN_PASS` periodically. Generate with `openssl rand -hex 24`.
 
 See [SECURITY.md](SECURITY.md) for the disclosure process.

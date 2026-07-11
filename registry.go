@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/docker/docker/client"
@@ -31,11 +32,7 @@ type Metrics struct {
 }
 
 type serviceState struct {
-	State      string
-	LastSeen   time.Time
-	StartedAt  time.Time
-	IP         string
-	ReadyChans []chan struct{}
+	State string
 }
 
 type Docknap struct {
@@ -60,17 +57,30 @@ type Docknap struct {
 	adminHost           string
 	networkName         string
 	tldCount            int
-	trustedProxies      []*cidr
+	trustedProxies      []cidr
 	rootCtx             context.Context
 	rootCancel          context.CancelFunc
 	sessions            *sessionStore
 	rateLimiter         *loginRateLimiter
+	waitLimiter         *loginRateLimiter
 	notifier            notifier
 	eventsOK            atomicBool
+	pollFallback        atomic.Bool
 
-	states    map[string]*serviceState
-	ipCache   map[string]string
-	ipCacheAt map[string]time.Time
+	states           map[string]*serviceState
+	ipCache          map[string]string
+	ipCacheAt        map[string]time.Time
+	lastState        map[string]string
+	dockerStartedAt  map[string]string
+	dockerID         map[string]string
+	startupTimedOut  map[string]bool
+	readinessWorkers map[string]*readinessAttempt
+}
+
+type readinessAttempt struct {
+	started time.Time
+	ctx     context.Context
+	cancel  context.CancelFunc
 }
 
 func (s *Docknap) eventsHealthy() bool { return s.eventsOK.get() }
@@ -91,21 +101,27 @@ func newDocknap(cli *client.Client, logger *Logger, reg *Registry) *Docknap {
 		State:      reg.Gauge("docknap_container_state", "Current container state (1 for active state)", []string{"subdomain", "state"}),
 	}
 	return &Docknap{
-		cli:         cli,
-		configs:     make(map[string]*Config),
-		idleTimers:  make(map[string]*time.Timer),
-		bootStarts:  make(map[string]time.Time),
-		startedAt:   make(map[string]time.Time),
-		events:      make(map[string][]Event),
-		startLocks:  make(map[string]*sync.Mutex),
-		states:      make(map[string]*serviceState),
-		ipCache:     make(map[string]string),
-		ipCacheAt:   make(map[string]time.Time),
-		logger:      logger,
-		metrics:     reg,
-		m:           m,
-		sessions:    newSessionStore(12 * time.Hour),
-		rateLimiter: newLoginRateLimiter(5, time.Minute),
+		cli:              cli,
+		configs:          make(map[string]*Config),
+		idleTimers:       make(map[string]*time.Timer),
+		bootStarts:       make(map[string]time.Time),
+		startedAt:        make(map[string]time.Time),
+		events:           make(map[string][]Event),
+		startLocks:       make(map[string]*sync.Mutex),
+		states:           make(map[string]*serviceState),
+		ipCache:          make(map[string]string),
+		ipCacheAt:        make(map[string]time.Time),
+		lastState:        make(map[string]string),
+		dockerStartedAt:  make(map[string]string),
+		dockerID:         make(map[string]string),
+		startupTimedOut:  make(map[string]bool),
+		readinessWorkers: make(map[string]*readinessAttempt),
+		logger:           logger,
+		metrics:          reg,
+		m:                m,
+		sessions:         newSessionStore(12 * time.Hour),
+		rateLimiter:      newLoginRateLimiter(5, time.Minute),
+		waitLimiter:      newLoginRateLimiter(30, time.Minute),
 	}
 }
 
@@ -135,48 +151,52 @@ func (s *Docknap) markBootStart(sub string) time.Time {
 	return now
 }
 
-func (s *Docknap) clearBootStart(sub string) {
-	s.mu.Lock()
-	delete(s.bootStarts, sub)
-	s.mu.Unlock()
-}
-
-func (s *Docknap) snapshotServices() (map[string]*Config, map[string]time.Time) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	cfgs := make(map[string]*Config, len(s.configs))
-	for k, v := range s.configs {
-		cfgs[k] = v
-	}
-	starts := make(map[string]time.Time, len(s.startedAt))
-	for k, v := range s.startedAt {
-		starts[k] = v
-	}
-	return cfgs, starts
-}
-
-func (s *Docknap) serviceStateCopy(sub string) *serviceState {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if st, ok := s.states[sub]; ok {
-		cp := *st
-		cp.ReadyChans = nil
-		return &cp
-	}
-	return &serviceState{State: "unknown"}
-}
-
-func (s *Docknap) updateState(sub, state string) {
+func (s *Docknap) claimReadinessWorker(sub string) (*readinessAttempt, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	st, ok := s.states[sub]
-	if !ok {
-		st = &serviceState{State: state}
-		s.states[sub] = st
-	} else {
-		st.State = state
+	if s.readinessWorkers == nil {
+		s.readinessWorkers = make(map[string]*readinessAttempt)
 	}
-	st.LastSeen = time.Now()
+	if attempt := s.readinessWorkers[sub]; attempt != nil {
+		return attempt, false
+	}
+	started, ok := s.bootStarts[sub]
+	if !ok {
+		started = time.Now()
+		s.bootStarts[sub] = started
+	}
+	rootCtx := s.rootCtx
+	if rootCtx == nil {
+		rootCtx = context.Background()
+	}
+	ctx, cancel := context.WithCancel(rootCtx)
+	attempt := &readinessAttempt{started: started, ctx: ctx, cancel: cancel}
+	s.readinessWorkers[sub] = attempt
+	return attempt, true
+}
+
+func (s *Docknap) finishReadinessAttempt(sub string, attempt *readinessAttempt) bool {
+	s.mu.Lock()
+	if s.readinessWorkers[sub] != attempt {
+		s.mu.Unlock()
+		return false
+	}
+	delete(s.readinessWorkers, sub)
+	delete(s.bootStarts, sub)
+	s.mu.Unlock()
+	attempt.cancel()
+	return true
+}
+
+func (s *Docknap) clearBootStart(sub string) {
+	s.mu.Lock()
+	attempt := s.readinessWorkers[sub]
+	delete(s.bootStarts, sub)
+	delete(s.readinessWorkers, sub)
+	s.mu.Unlock()
+	if attempt != nil {
+		attempt.cancel()
+	}
 }
 
 func (s *Docknap) setStateIP(sub, ip string) {
@@ -202,34 +222,4 @@ func (s *Docknap) cachedIP(sub string) (string, bool) {
 		return "", false
 	}
 	return ip, true
-}
-
-func (s *Docknap) subscribeReady(sub string) chan struct{} {
-	ch := make(chan struct{}, 1)
-	s.mu.Lock()
-	if st, ok := s.states[sub]; ok {
-		st.ReadyChans = append(st.ReadyChans, ch)
-	} else {
-		s.states[sub] = &serviceState{ReadyChans: []chan struct{}{ch}}
-	}
-	s.mu.Unlock()
-	return ch
-}
-
-func (s *Docknap) broadcastReady(sub string) {
-	s.mu.Lock()
-	st, ok := s.states[sub]
-	if !ok {
-		s.mu.Unlock()
-		return
-	}
-	chans := st.ReadyChans
-	st.ReadyChans = nil
-	s.mu.Unlock()
-	for _, ch := range chans {
-		select {
-		case ch <- struct{}{}:
-		default:
-		}
-	}
 }

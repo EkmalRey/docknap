@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -23,65 +24,62 @@ func (s *Docknap) listOpts() container.ListOptions {
 	}
 }
 
+// discover performs the initial registry sync and arms idle timers for
+// already-running services. It reuses syncContainers so discovery and runtime
+// reconciliation share one code path.
 func (s *Docknap) discover(ctx context.Context) error {
-	containers, err := s.cli.ContainerList(ctx, s.listOpts())
-	if err != nil {
-		return err
-	}
-
-	for _, c := range containers {
-		cfg, ok := s.parseLabels(c.Labels)
-		if !ok {
-			continue
-		}
-		name := strings.TrimPrefix(c.Names[0], "/")
-		cfg.Container = name
-		s.mu.Lock()
-		s.configs[cfg.Subdomain] = cfg
-		if _, ok := s.states[cfg.Subdomain]; !ok {
-			s.states[cfg.Subdomain] = &serviceState{State: c.State}
-		}
-		s.mu.Unlock()
-		if c.State == "running" {
-			info, err := s.cli.ContainerInspect(ctx, name)
-			if err == nil && info.State.Running && info.State.StartedAt != "" {
-				if t, err := time.Parse(time.RFC3339Nano, info.State.StartedAt); err == nil {
-					s.mu.Lock()
-					s.startedAt[cfg.Subdomain] = t
-					s.mu.Unlock()
-					s.armIdleTimer(cfg)
-				}
-			}
-		}
-	}
-	return nil
+	return s.syncContainers(ctx)
 }
 
 func (s *Docknap) watch(ctx context.Context) {
-	if err := s.subscribeDockerEvents(ctx); err == nil {
-		s.eventsOK.set(true)
-		s.logger.Info("watching docker events", F("source", "events"))
-		<-ctx.Done()
-		return
-	} else {
+	if err := s.subscribeDockerEvents(ctx); err != nil {
 		s.eventsOK.set(false)
 		s.logger.Warn("docker events subscription failed, falling back to poll",
 			F("err", err.Error()))
+		s.watchPoll(ctx)
+		return
 	}
-	s.watchPoll(ctx)
+	// Event stream goroutine runs until the channel closes or errors, at which
+	// point it transitions into exactly one poll loop via fallbackToPoll.
+	<-ctx.Done()
 }
 
 func (s *Docknap) watchPoll(ctx context.Context) {
+	// Poll mode is a fully working watch (the 10s resync is the safety net).
+	// Readiness reports healthy only after the first successful sync, so a
+	// failing Docker list does not mask an outage as healthy.
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
+	s.runPollSync(ctx)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			s.runPollSync(ctx)
 		}
-		s.syncContainers(ctx)
 	}
+}
+
+func (s *Docknap) runPollSync(ctx context.Context) {
+	if err := s.syncContainers(ctx); err != nil {
+		s.eventsOK.set(false)
+	} else {
+		s.eventsOK.set(true)
+	}
+}
+
+// fallbackToPoll starts the poll loop exactly once for the lifetime of the
+// process. Both an event-channel close and a stream error route here, so we
+// never end up with two poll loops or a frozen watch.
+func (s *Docknap) fallbackToPoll(ctx context.Context) {
+	if !s.pollFallback.CompareAndSwap(false, true) {
+		return
+	}
+	s.eventsOK.set(false)
+	s.logger.Warn("docker events stream ended, switching to poll mode",
+		F("reason", "stream closed or errored"))
+	go s.watchPoll(ctx)
 }
 
 func (s *Docknap) subscribeDockerEvents(ctx context.Context) error {
@@ -106,102 +104,266 @@ func (s *Docknap) subscribeDockerEvents(ctx context.Context) error {
 				return
 			case e, ok := <-msgs:
 				if !ok {
+					s.fallbackToPoll(ctx)
 					return
 				}
 				s.logger.Debug("docker event", F("action", e.Action), F("name", e.Actor.Attributes["name"]))
 				debounce = time.After(500 * time.Millisecond)
 			case <-debounce:
-				s.syncContainers(ctx)
+				_ = s.syncContainers(ctx)
 				debounce = nil
 			case <-ticker.C:
-				s.syncContainers(ctx)
-			case err := <-errCh:
+				_ = s.syncContainers(ctx)
+			case err, ok := <-errCh:
+				if !ok {
+					s.fallbackToPoll(ctx)
+					return
+				}
 				if err != nil {
-					s.eventsOK.set(false)
 					s.logger.Warn("docker events stream error, falling back to poll", F("err", err.Error()))
-					go s.watchPoll(ctx)
+					s.fallbackToPoll(ctx)
 					return
 				}
 			}
 		}
 	}()
+	s.eventsOK.set(true)
 	return nil
 }
 
-func (s *Docknap) syncContainers(ctx context.Context) {
+type containerInfo struct {
+	cfg       *Config
+	container string
+	id        string
+	state     string
+	running   bool
+	startedAt string
+}
+
+// syncContainers rebuilds the desired registry from currently valid, labeled
+// containers and reconciles it atomically against the live one. Docker API
+// calls are gathered outside the state lock; the lock is held only for the
+// short reconciliation commit. See audit items #3, #4, #13, #15, #16, #17, #18.
+func (s *Docknap) syncContainers(ctx context.Context) error {
 	containers, err := s.cli.ContainerList(ctx, s.listOpts())
 	if err != nil {
 		s.logger.Warn("watch list failed", F("err", err.Error()))
-		return
+		return err
 	}
 
-	found := make(map[string]bool)
-	known := make(map[string]*Config)
-	s.mu.RLock()
-	for _, cfg := range s.configs {
-		known[cfg.Container] = cfg
-	}
-	s.mu.RUnlock()
-
-	for _, c := range containers {
-		name := strings.TrimPrefix(c.Names[0], "/")
-		if _, ok := known[name]; ok {
-			found[name] = true
-		}
-	}
-
-	var toArm []*Config
-	s.mu.Lock()
-	for name, cfg := range known {
-		if !found[name] {
-			s.logger.Info("container disappeared", F("container", name), F("subdomain", cfg.Subdomain))
-			s.notifier.notify("disappeared", cfg.Subdomain, name, "container no longer present in registry", nil)
-			delete(s.configs, cfg.Subdomain)
-			if t, ok := s.idleTimers[name]; ok {
-				t.Stop()
-				delete(s.idleTimers, name)
-			}
-			delete(s.bootStarts, cfg.Subdomain)
-			delete(s.startedAt, cfg.Subdomain)
-			delete(s.startLocks, name)
-			delete(s.states, cfg.Subdomain)
-			delete(s.ipCache, cfg.Subdomain)
-			delete(s.ipCacheAt, cfg.Subdomain)
-			s.recordEventLocked(cfg.Subdomain, "disappeared", "container no longer present in registry", nil)
-		}
-	}
-
+	bySub := make(map[string]struct {
+		cfg   *Config
+		name  string
+		id    string
+		state string
+	}, len(containers))
 	for _, c := range containers {
 		cfg, ok := s.parseLabels(c.Labels)
 		if !ok {
 			continue
 		}
+		if len(c.Names) == 0 {
+			s.logger.Warn("labeled Docker container is nameless; skipping", F("container_id", c.ID))
+			continue
+		}
 		name := strings.TrimPrefix(c.Names[0], "/")
-		if existing, exists := s.configs[cfg.Subdomain]; !exists || existing.Container != name {
-			cfg.Container = name
-			s.configs[cfg.Subdomain] = cfg
-			s.logger.Info("registered", F("subdomain", cfg.Subdomain), F("container", name))
+		cfg.Container = name
+		sub := cfg.Subdomain
+		if existing, exists := bySub[sub]; exists {
+			s.logger.Warn("duplicate docknap.subdomain; rejecting all owners",
+				F("subdomain", sub), F("first", existing.name), F("conflict", name))
+			bySub[sub] = struct {
+				cfg   *Config
+				name  string
+				id    string
+				state string
+			}{}
+			continue
 		}
-		if existing, exists := s.states[cfg.Subdomain]; !exists {
-			s.states[cfg.Subdomain] = &serviceState{State: c.State}
-		} else {
-			existing.State = c.State
+		state := c.State
+		// Docker list reports paused containers as State=running;
+		// detect via Status suffix so we don't arm idle timers.
+		if strings.Contains(c.Status, "(paused)") {
+			state = "paused"
 		}
-		if c.State == "running" {
-			info, err := s.cli.ContainerInspect(ctx, name)
-			if err == nil && info.State.StartedAt != "" {
-				if t, err := time.Parse(time.RFC3339Nano, info.State.StartedAt); err == nil {
-					s.startedAt[cfg.Subdomain] = t
-				}
-			}
-			toArm = append(toArm, cfg)
+		bySub[sub] = struct {
+			cfg   *Config
+			name  string
+			id    string
+			state string
+		}{cfg, name, c.ID, state}
+	}
+
+	next := make(map[string]*containerInfo, len(bySub))
+	for sub, rc := range bySub {
+		if rc.cfg == nil {
+			continue
+		}
+		next[sub] = &containerInfo{
+			cfg:       rc.cfg,
+			container: rc.name,
+			id:        rc.id,
+			state:     rc.state,
+			running:   rc.state == "running",
 		}
 	}
+
+	// Inspect outside the lock. Inspect a running container when it is a new
+	// registration (no start timestamp yet), when its Docker ID changed (a
+	// restart/relabel we must detect to invalidate the cached IP), or on a
+	// running-state transition. This bounds Docker API traffic while still
+	// catching restarts without needing to inspect on every sync (audit #2, #15).
+	for _, info := range next {
+		if !info.running {
+			continue
+		}
+		s.mu.RLock()
+		wasRunning := s.lastState[info.cfg.Subdomain] == "running"
+		prevID := s.dockerID[info.cfg.Subdomain]
+		s.mu.RUnlock()
+		if wasRunning && prevID == info.id {
+			s.mu.RLock()
+			info.startedAt = s.dockerStartedAt[info.cfg.Subdomain]
+			s.mu.RUnlock()
+			if info.startedAt != "" {
+				continue
+			}
+		}
+		insp, ierr := s.cli.ContainerInspect(ctx, info.container)
+		if ierr != nil || insp.State.StartedAt == "" {
+			continue
+		}
+		info.startedAt = insp.State.StartedAt
+	}
+
+	var toArm, toReset []*Config
+	s.mu.Lock()
+	// 1) Remove routes whose container is gone or no longer carries valid labels.
+	for sub, old := range s.configs {
+		info, ok := next[sub]
+		if !ok {
+			s.removeServiceLocked(sub, old.Container)
+			continue
+		}
+		if info.container != old.Container {
+			s.removeServiceLocked(sub, old.Container)
+		}
+	}
+	// 2) Add / update from the desired registry.
+	for sub, info := range next {
+		old, existed := s.configs[sub]
+		s.configs[sub] = info.cfg
+		s.lastState[sub] = info.state
+		if !existed {
+			s.logger.Info("registered", F("subdomain", sub), F("container", info.container))
+		} else if info.container != old.Container {
+			s.logger.Info("re-registered", F("subdomain", sub), F("container", info.container))
+		}
+
+		if st, ok := s.states[sub]; ok {
+			st.State = info.state
+		} else {
+			s.states[sub] = &serviceState{State: info.state}
+		}
+
+		// A container restart produces a new Docker ID even when it is running
+		// at both observations, so detect it cheaply and drop the stale IP /
+		// start identity (audit #2).
+		if prev := s.dockerID[sub]; prev != "" && prev != info.id {
+			delete(s.ipCache, sub)
+			delete(s.ipCacheAt, sub)
+			delete(s.dockerStartedAt, sub)
+			delete(s.startedAt, sub)
+			delete(s.startupTimedOut, sub)
+		}
+		s.dockerID[sub] = info.id
+
+		// Invalidate the IP cache whenever the Docker start identity changes.
+		if info.startedAt != "" {
+			if prev := s.dockerStartedAt[sub]; prev != "" && prev != info.startedAt {
+				delete(s.ipCache, sub)
+				delete(s.ipCacheAt, sub)
+			}
+			s.dockerStartedAt[sub] = info.startedAt
+			if t, err := time.Parse(time.RFC3339Nano, info.startedAt); err == nil {
+				s.startedAt[sub] = t
+			}
+		}
+
+		// Arm idle timers for warmed-up running services that are not currently
+		// booting, so a slow booting container is not idle-stopped before it is
+		// usable (audit #18). `startedAt` is captured for every running service
+		// above, so a pre-existing long-lived container is armed even if it was
+		// already up when docknap started (audit #1).
+		_, booting := s.bootStarts[sub]
+		age := time.Since(mustParseStartedAt(info.startedAt))
+		warmed := info.running && !booting && info.startedAt != "" && age >= info.cfg.StartupTimeout
+		if warmed {
+			toArm = append(toArm, info.cfg)
+			// Re-arm with the new idle timeout when an existing service's
+			// configuration changed (audit #4).
+			if existed && old.Container == info.container && old.IdleTimeout != info.cfg.IdleTimeout {
+				toReset = append(toReset, info.cfg)
+			}
+		}
+	}
+	s.m.Registered.Set(nil, float64(len(s.configs)))
 	s.mu.Unlock()
+
 	for _, cfg := range toArm {
 		s.armIdleTimer(cfg)
 	}
-	s.m.Registered.Set(nil, float64(len(s.configs)))
+	for _, cfg := range toReset {
+		s.resetIdleTimer(cfg)
+	}
+	return nil
+}
+
+func mustParseStartedAt(s string) time.Time {
+	t, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+
+func (s *Docknap) removeServiceLocked(sub, container string) {
+	cfg := s.configs[sub]
+	name := container
+	if cfg != nil {
+		name = cfg.Container
+	}
+	s.logger.Info("removing service", F("subdomain", sub), F("container", name))
+	s.notifier.notify("disappeared", sub, name, "container no longer labeled or present", nil)
+	s.recordEventLocked(sub, "disappeared", "container no longer labeled or present", nil)
+	delete(s.configs, sub)
+	if e, ok := s.idleTimers[name]; ok {
+		e.Stop()
+		delete(s.idleTimers, name)
+	}
+	delete(s.bootStarts, sub)
+	if attempt := s.readinessWorkers[sub]; attempt != nil {
+		attempt.cancel()
+	}
+	delete(s.readinessWorkers, sub)
+	delete(s.startedAt, sub)
+	delete(s.startLocks, name)
+	delete(s.states, sub)
+	delete(s.ipCache, sub)
+	delete(s.ipCacheAt, sub)
+	delete(s.dockerStartedAt, sub)
+	delete(s.dockerID, sub)
+	delete(s.lastState, sub)
+	delete(s.startupTimedOut, sub)
+	// Drop metric series for the retired subdomain to avoid unbounded cardinality.
+	s.m.Proxy.DeletePrefix(sub)
+	s.m.ProxyDur.DeletePrefix(sub)
+	s.m.Starts.DeletePrefix(sub)
+	s.m.Stops.DeletePrefix(sub)
+	s.m.IdleStop.DeletePrefix(sub)
+	s.m.StartFail.DeletePrefix(sub)
+	s.m.StartDur.DeletePrefix(sub)
+	s.m.State.DeletePrefix(sub)
 }
 
 func (s *Docknap) recordEventLocked(sub, eventType, message string, fields map[string]interface{}) {
@@ -212,6 +374,20 @@ func (s *Docknap) recordEventLocked(sub, eventType, message string, fields map[s
 		hist = hist[len(hist)-maxEventsPerService:]
 	}
 	s.events[sub] = hist
+}
+
+// containerIP returns the container's IP, using the 30s cache when fresh and
+// falling back to a Docker inspect on miss/stale.
+func (s *Docknap) containerIP(ctx context.Context, cfg *Config) (string, error) {
+	if ip, ok := s.cachedIP(cfg.Subdomain); ok {
+		return ip, nil
+	}
+	ip, err := s.getContainerIP(ctx, cfg.Container)
+	if err != nil {
+		return "", err
+	}
+	s.setStateIP(cfg.Subdomain, ip)
+	return ip, nil
 }
 
 func (s *Docknap) getContainerIP(ctx context.Context, name string) (string, error) {
@@ -227,7 +403,7 @@ func (s *Docknap) getContainerIP(ctx context.Context, name string) (string, erro
 }
 
 func (s *Docknap) checkPort(ctx context.Context, cfg *Config) (string, bool) {
-	ip, err := s.getContainerIP(ctx, cfg.Container)
+	ip, err := s.containerIP(ctx, cfg)
 	if err != nil || ip == "" {
 		return "", false
 	}
@@ -249,30 +425,31 @@ func (s *Docknap) checkPort(ctx context.Context, cfg *Config) (string, bool) {
 	if err != nil {
 		return ip, false
 	}
-	conn.Close()
+	_ = conn.Close()
 	return ip, true
+}
+
+// healthClient is a single shared HTTP client for readiness probes.
+var healthClient = &http.Client{
+	Timeout: 1 * time.Second,
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
 }
 
 func (s *Docknap) checkHTTPHealth(ctx context.Context, ip string, cfg *Config) (string, bool) {
 	addr := net.JoinHostPort(ip, strconv.Itoa(cfg.TargetPort))
 	u := &url.URL{Scheme: "http", Host: addr, Path: cfg.HealthPath}
-	reqCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, u.String(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
 		return ip, false
 	}
-	cli := &http.Client{
-		Timeout: 1 * time.Second,
-		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
-	resp, err := cli.Do(req)
+	resp, err := healthClient.Do(req)
 	if err != nil {
 		return ip, false
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64*1024))
 	if resp.StatusCode >= 200 && resp.StatusCode < 400 {
 		return ip, true
 	}
@@ -280,7 +457,7 @@ func (s *Docknap) checkHTTPHealth(ctx context.Context, ip string, cfg *Config) (
 }
 
 func (s *Docknap) getTargetURL(ctx context.Context, cfg *Config) (*url.URL, error) {
-	ip, err := s.getContainerIP(ctx, cfg.Container)
+	ip, err := s.containerIP(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -301,53 +478,78 @@ func (s *Docknap) startContainer(ctx context.Context, cfg *Config) error {
 	}
 	// For pause strategy, the container is "running" but paused; treat that
 	// as not-ready so waitForReady kicks in.
-	if info.State.Running && !(cfg.Strategy == "pause" && info.State.Paused) {
+	if info.State.Running && (cfg.Strategy != "pause" || !info.State.Paused) {
+		attempt, owner := s.claimReadinessWorker(cfg.Subdomain)
+		if owner {
+			go s.waitForReady(cfg, attempt)
+		}
 		return nil
 	}
 	s.m.Starts.Add(map[string]string{"subdomain": cfg.Subdomain}, 1)
 	s.recordEvent(cfg.Subdomain, "start_requested", "container start requested", nil)
 	s.notifier.notify("start_requested", cfg.Subdomain, cfg.Container, "container start requested", nil)
-	s.markBootStart(cfg.Subdomain)
+	// A new start attempt must not be suppressed by a stale timeout flag from a
+	// previous boot (audit #8).
+	s.mu.Lock()
+	delete(s.startupTimedOut, cfg.Subdomain)
+	s.mu.Unlock()
+	attempt, owner := s.claimReadinessWorker(cfg.Subdomain)
 	s.logger.Info("starting container", F("subdomain", cfg.Subdomain), F("container", cfg.Container))
-	bootStart := time.Now()
 	if cfg.Strategy == "pause" && info.State.Paused {
 		if err := s.cli.ContainerUnpause(ctx, cfg.Container); err != nil {
-			s.clearBootStart(cfg.Subdomain)
+			s.finishReadinessAttempt(cfg.Subdomain, attempt)
 			s.recordEvent(cfg.Subdomain, "start_error", err.Error(), nil)
 			s.notifier.notify("start_error", cfg.Subdomain, cfg.Container, err.Error(), nil)
 			return err
 		}
 	} else {
 		if err := s.cli.ContainerStart(ctx, cfg.Container, container.StartOptions{}); err != nil {
-			s.clearBootStart(cfg.Subdomain)
+			s.finishReadinessAttempt(cfg.Subdomain, attempt)
 			s.recordEvent(cfg.Subdomain, "start_error", err.Error(), nil)
 			s.notifier.notify("start_error", cfg.Subdomain, cfg.Container, err.Error(), nil)
 			return err
 		}
 	}
 
-	go s.waitForReady(cfg, bootStart)
+	if owner {
+		go s.waitForReady(cfg, attempt)
+	}
 	return nil
 }
 
-func (s *Docknap) waitForReady(cfg *Config, bootStart time.Time) {
+// waitForReady probes readiness until the port accepts connections or the
+// service's StartupTimeout elapses. A timed-out boot is recorded exactly once
+// (audit #6, #7).
+func (s *Docknap) waitForReady(cfg *Config, attempt *readinessAttempt) {
+	timeout := cfg.StartupTimeout
+	if timeout <= 0 {
+		timeout = s.startTimeoutDefault
+	}
+	ctx, cancel := context.WithTimeout(attempt.ctx, timeout)
+	defer cancel()
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
-	bg, cancel := context.WithCancel(s.rootCtx)
-	defer cancel()
 	for {
 		select {
-		case <-bg.Done():
+		case <-ctx.Done():
+			if ctx.Err() == context.DeadlineExceeded {
+				s.markStartupTimedOut(cfg, attempt)
+			} else {
+				s.finishReadinessAttempt(cfg.Subdomain, attempt)
+			}
 			return
 		case <-ticker.C:
-			ip, ready := s.checkPort(bg, cfg)
+			ip, ready := s.checkPort(ctx, cfg)
 			if !ready {
 				continue
 			}
-			elapsed := time.Since(bootStart)
+			if !s.finishReadinessAttempt(cfg.Subdomain, attempt) {
+				return
+			}
+			elapsed := time.Since(attempt.started)
 			s.m.StartDur.Observe(map[string]string{"subdomain": cfg.Subdomain}, elapsed.Seconds())
 			s.mu.Lock()
-			delete(s.bootStarts, cfg.Subdomain)
+			delete(s.startupTimedOut, cfg.Subdomain)
 			s.startedAt[cfg.Subdomain] = time.Now()
 			s.ipCache[cfg.Subdomain] = ip
 			s.ipCacheAt[cfg.Subdomain] = time.Now()
@@ -361,10 +563,30 @@ func (s *Docknap) waitForReady(cfg *Config, bootStart time.Time) {
 				F("container", cfg.Container),
 				F("elapsed_ms", elapsed.Milliseconds()),
 				F("ip", ip))
-			s.broadcastReady(cfg.Subdomain)
+			s.armIdleTimer(cfg)
 			return
 		}
 	}
+}
+
+// markStartupTimedOut records a startup timeout exactly once per boot attempt.
+func (s *Docknap) markStartupTimedOut(cfg *Config, attempt *readinessAttempt) {
+	s.mu.Lock()
+	if s.readinessWorkers[cfg.Subdomain] != attempt || s.startupTimedOut[cfg.Subdomain] {
+		s.mu.Unlock()
+		return
+	}
+	s.startupTimedOut[cfg.Subdomain] = true
+	delete(s.readinessWorkers, cfg.Subdomain)
+	delete(s.bootStarts, cfg.Subdomain)
+	s.mu.Unlock()
+	attempt.cancel()
+	s.m.StartFail.Add(map[string]string{"subdomain": cfg.Subdomain, "reason": "startup_timeout"}, 1)
+	s.recordEvent(cfg.Subdomain, "startup_timeout", "startup timeout exceeded",
+		map[string]interface{}{"timeout_s": int(cfg.StartupTimeout.Seconds())})
+	s.notifier.notify("startup_timeout", cfg.Subdomain, cfg.Container, "startup timeout exceeded",
+		map[string]any{"timeout_s": int(cfg.StartupTimeout.Seconds())})
+	s.logger.Warn("startup timeout", F("subdomain", cfg.Subdomain), F("container", cfg.Container))
 }
 
 func (s *Docknap) acquireStartLock(name string) *sync.Mutex {

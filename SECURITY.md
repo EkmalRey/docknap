@@ -8,18 +8,26 @@ Treat the docknap listen address as equivalent to shell access on the Docker hos
 
 ## Supported versions
 
+Only the latest stable GitHub release is supported with security updates.
+
 | Version | Supported |
 |---------|-----------|
-| latest  | yes       |
-| < latest | no       |
+| Latest stable release  | Yes |
+| < latest stable release | No |
 
 ## Required hardening
 
-1. **Always run docknap behind a TLS-terminating reverse proxy** (Caddy, nginx, Traefik, etc.). The session cookie and HTTP Basic Auth both send credentials base64-encoded, not encrypted.
+1. **Always run docknap behind a TLS-terminating reverse proxy** (Caddy, nginx, Traefik, etc.). HTTP Basic Auth carries base64-encoded credentials and the session cookie carries an unencrypted opaque bearer token; both require TLS between the client and the reverse proxy.
 2. **Set `DOCKNAP_ADMIN_USER` and `DOCKNAP_ADMIN_PASS`** in non-trivial environments. docknap will log a warning at startup if these are unset.
 3. **Bind docknap's port to a trusted network only** (e.g. a private Docker network, not `0.0.0.0` on a public host).
 4. **Restrict the Docker socket** — use a dedicated low-privilege user account or rootless Docker where the engine supports it.
 5. **Rotate `DOCKNAP_ADMIN_PASS` periodically.** Generate with `openssl rand -hex 24`.
+
+## Scanner exceptions
+
+`CVE-2026-34040` is temporarily excluded from image scans until 2026-10-01. Trivy attributes this Docker Engine authorization-plugin bypass to the embedded `github.com/docker/docker` Go client. docknap does not include an Engine daemon, run authorization plugins, or expose the affected daemon request-processing path. Review this exception whenever the Docker SDK changes and remove it if the client becomes affected or a compatible corrected module is published.
+
+All other high and critical findings remain release blockers.
 
 ## Reporting a vulnerability
 

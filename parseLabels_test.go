@@ -133,19 +133,32 @@ func TestParseLabels_Overrides(t *testing.T) {
 	}
 }
 
-func TestParseLabels_InvalidDurationFallsBack(t *testing.T) {
+func TestParseLabelsRejectsInvalidExplicitValues(t *testing.T) {
 	s := newTestDocknap()
-	cfg, ok := s.parseLabels(map[string]string{
-		"docknap.enable":       "true",
-		"docknap.subdomain":    "x",
-		"docknap.target_port":  "80",
-		"docknap.idle_timeout": "not-a-duration",
-	})
-	if !ok {
-		t.Fatal("expected ok=true")
+	for name, invalid := range map[string]map[string]string{
+		"idle duration":    {"docknap.idle_timeout": "bad"},
+		"startup duration": {"docknap.startup_timeout": "0s"},
+		"boolean":          {"docknap.show_logs": "yes"},
+		"theme":            {"docknap.theme": "nope"},
+		"strategy":         {"docknap.strategy": "freeze"},
+		"pause health":     {"docknap.strategy": "pause"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			labels := map[string]string{"docknap.enable": "true", "docknap.subdomain": "x", "docknap.target_port": "80"}
+			for key, value := range invalid {
+				labels[key] = value
+			}
+			if _, ok := s.parseLabels(labels); ok {
+				t.Fatal("expected invalid labels to be rejected")
+			}
+		})
 	}
-	if cfg.IdleTimeout != 5*time.Minute {
-		t.Errorf("expected fallback to default 5m, got %v", cfg.IdleTimeout)
+}
+
+func TestParseEnvRejectsMalformedExplicitValues(t *testing.T) {
+	t.Setenv("DOCKNAP_IDLE_DEFAULT", "bad")
+	if _, err := parseEnv(); err == nil {
+		t.Fatal("expected malformed environment error")
 	}
 }
 

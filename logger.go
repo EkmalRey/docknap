@@ -59,14 +59,14 @@ func (l *Logger) log(level LogLevel, msg string, fields map[string]any) {
 	}
 	buf, err := json.Marshal(record)
 	if err != nil {
-		fmt.Fprintf(l.out, `{"ts":%q,"level":"error","msg":"log marshal failed","err":%q}`+"\n",
+		_, _ = fmt.Fprintf(l.out, `{"ts":%q,"level":"error","msg":"log marshal failed","err":%q}`+"\n",
 			time.Now().UTC().Format(time.RFC3339Nano), err.Error())
 		return
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.out.Write(buf)
-	l.out.Write([]byte("\n"))
+	_, _ = l.out.Write(buf)
+	_, _ = l.out.Write([]byte("\n"))
 }
 
 func (l *Logger) text(level LogLevel, msg string, fields map[string]any) {
@@ -103,7 +103,7 @@ func (l *Logger) text(level LogLevel, msg string, fields map[string]any) {
 	b = append(b, '\n')
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.out.Write(b)
+	_, _ = l.out.Write(b)
 }
 
 func (l *Logger) Debug(msg string, fields ...Field) { l.log(LevelDebug, msg, fieldsToMap(fields)) }

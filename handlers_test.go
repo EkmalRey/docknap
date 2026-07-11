@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/base64"
 	"encoding/json"
+	"net"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -129,24 +130,38 @@ func TestRateLimitedLoginShowsRateLimitError(t *testing.T) {
 }
 
 func TestParseTrustedProxies(t *testing.T) {
-	proxies := parseTrustedProxies("10.0.0.0/8, 192.168.1.5 , invalid, , 172.16.0.0/12")
-	if len(proxies) != 3 {
-		t.Fatalf("expected 3 valid CIDRs, got %d", len(proxies))
+	tests := []struct {
+		name    string
+		input   string
+		want    int
+		wantErr bool
+	}{
+		{name: "valid list", input: "10.0.0.0/8, 192.168.1.5, 172.16.0.0/12", want: 3},
+		{name: "empty string", input: "", want: 0},
+		{name: "whitespace only", input: "   ", want: 0},
+		{name: "single valid CIDR", input: "10.0.0.0/8", want: 1},
+		{name: "single invalid CIDR", input: "invalid", wantErr: true},
+		{name: "mixed valid and invalid", input: "10.0.0.0/8, bad, 192.168.0.0/16", wantErr: true},
+		{name: "CIDR without mask gets /32", input: "192.168.1.5", want: 1},
 	}
-	if !proxies[0].contains(parseIP("10.5.5.5")) {
-		t.Error("10.5.5.5 should be in 10.0.0.0/8")
-	}
-	if proxies[0].contains(parseIP("11.0.0.1")) {
-		t.Error("11.0.0.1 should not be in 10.0.0.0/8")
-	}
-	if !proxies[2].contains(parseIP("172.16.99.99")) {
-		t.Error("172.16.99.99 should be in 172.16.0.0/12")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			proxies, err := parseTrustedProxies(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("parseTrustedProxies(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
+				return
+			}
+			if len(proxies) != tt.want {
+				t.Errorf("parseTrustedProxies(%q) got %d CIDRs, want %d", tt.input, len(proxies), tt.want)
+			}
+		})
 	}
 }
 
 func TestRequestIsHTTPSTrustedProxy(t *testing.T) {
 	s := newAuthTestDocknap(t)
-	s.trustedProxies = parseTrustedProxies("10.0.0.0/8")
+	tp, _ := parseTrustedProxies("10.0.0.0/8")
+	s.trustedProxies = tp
 
 	r := httptest.NewRequest("GET", "/", nil)
 	r.RemoteAddr = "10.1.2.3:5555"
@@ -169,37 +184,49 @@ func TestRequestIsHTTPSTrustedProxy(t *testing.T) {
 }
 
 func TestHandleWaitElapsedFallsBackToStartedAt(t *testing.T) {
-	// When bootStart is zero and the container is running (startedAt is set),
-	// handleWait should compute elapsed from startedAt.
+	// Exercise the real handleWait handler with a running port and startedAt set.
+	// handleWait reads startedAt at entry; verify elapsed comes from it.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = listener.Close() }()
+	port := listener.Addr().(*net.TCPAddr).Port
+
 	s := newAuthTestDocknap(t)
+	s.rootCtx = t.Context()
+	s.waitLimiter = newLoginRateLimiter(30, time.Minute)
+	s.startupTimedOut = make(map[string]bool)
+	s.readinessWorkers = make(map[string]*readinessAttempt)
 	cfg := &Config{
 		Subdomain:      "demo",
-		Container:      "demo-1",
-		TargetPort:     80,
-		StartupTimeout: 30 * time.Second,
-		IdleTimeout:    5 * time.Minute,
+		Container:      "demo",
+		TargetPort:     port,
+		StartupTimeout: time.Hour,
+		IdleTimeout:    time.Hour,
 	}
 	s.configs["demo"] = cfg
+	s.ipCache["demo"] = "127.0.0.1"
+	s.ipCacheAt["demo"] = time.Now()
 
-	// No port check will happen because checkPort calls getContainerIP which
-	// calls cli.ContainerInspect. Provide a stub: we'll set bootStart = zero
-	// and startedAt = now-5s. Then portOpen=true (via state cache).
-	// We can avoid the docker client by using a state cache and an inspect
-	// hook... but the proxy path requires real Docker. Simpler: just exercise
-	// the elapsed-fallback arithmetic directly.
-	bootStart := time.Time{}
+	// Set startedAt ~5s ago, leave bootStart empty so elapsed = time.Since(startedAt).
 	startedAt := time.Now().Add(-5 * time.Second)
-	_ = bootStart
-	_ = startedAt
+	s.mu.Lock()
+	s.startedAt["demo"] = startedAt
+	s.mu.Unlock()
 
-	var elapsed time.Duration
-	switch {
-	case !bootStart.IsZero():
-		elapsed = time.Since(bootStart)
-	case !startedAt.IsZero():
-		elapsed = time.Since(startedAt)
+	rr := httptest.NewRecorder()
+	s.handleWait(rr, httptest.NewRequest("GET", "/_docknap/wait/demo", nil))
+
+	var body map[string]interface{}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("bad JSON: %v\nbody: %s", err, rr.Body.String())
 	}
-	if elapsed < 4*time.Second || elapsed > 6*time.Second {
+	if body["ready"] != true {
+		t.Errorf("ready = %v, want true", body["ready"])
+	}
+	elapsed := body["elapsed"].(float64)
+	if elapsed < 4 || elapsed > 6 {
 		t.Errorf("elapsed = %v, want ~5s", elapsed)
 	}
 }
@@ -282,18 +309,6 @@ func TestBootJSON(t *testing.T) {
 	}
 }
 
-func TestServiceStateCopy(t *testing.T) {
-	s := newAuthTestDocknap(t)
-	s.states["demo"] = &serviceState{State: "running", ReadyChans: []chan struct{}{make(chan struct{}, 1)}}
-	cp := s.serviceStateCopy("demo")
-	if cp.State != "running" {
-		t.Errorf("State = %s, want running", cp.State)
-	}
-	if cp.ReadyChans != nil {
-		t.Error("ReadyChans should not be copied out")
-	}
-}
-
 func TestUpdateAndCachedIP(t *testing.T) {
 	s := newAuthTestDocknap(t)
 	s.setStateIP("demo", "10.0.0.1")
@@ -311,29 +326,6 @@ func TestUpdateAndCachedIP(t *testing.T) {
 	s.setStateIP("demo", "")
 	if _, ok := s.cachedIP("demo"); ok {
 		t.Error("cleared IP should not be cached")
-	}
-}
-
-func TestBroadcastReady(t *testing.T) {
-	s := newAuthTestDocknap(t)
-	ch1 := s.subscribeReady("demo")
-	ch2 := s.subscribeReady("demo")
-	s.broadcastReady("demo")
-	for i, ch := range []chan struct{}{ch1, ch2} {
-		select {
-		case <-ch:
-		case <-time.After(time.Second):
-			t.Errorf("subscriber %d did not receive", i+1)
-		}
-	}
-	// Second broadcast: subscribers should have been cleared
-	s.broadcastReady("demo")
-	// ch1 and ch2 are buffered to 1, full; a second send is dropped. Verify
-	// the ReadyChans slice is empty.
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if len(s.states["demo"].ReadyChans) != 0 {
-		t.Errorf("ReadyChans should be empty after broadcast, got %d", len(s.states["demo"].ReadyChans))
 	}
 }
 
@@ -355,31 +347,4 @@ func TestSplitNulHandler(t *testing.T) {
 	if got := splitNul("a\x00b\x00"); len(got) != 2 || got[0] != "a" || got[1] != "b" {
 		t.Errorf("splitNul = %v", got)
 	}
-}
-
-func parseIP(s string) []byte {
-	var ip [16]byte
-	n := 0
-	cur := 0
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c == '.' {
-			if n >= 4 {
-				return nil
-			}
-			ip[n] = byte(cur)
-			n++
-			cur = 0
-			continue
-		}
-		if c < '0' || c > '9' {
-			return nil
-		}
-		cur = cur*10 + int(c-'0')
-	}
-	if n < 4 {
-		ip[n] = byte(cur)
-		n++
-	}
-	return ip[:n]
 }

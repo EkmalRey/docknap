@@ -72,7 +72,7 @@
   </div>
 </div>
 <footer>powered by docknap</footer>
-<script>
+<script nonce="{{.Nonce}}">
 const SHOW_LOGS = {{.ShowLogs}};
 const SHOW_STATS = {{.ShowStats}};
 const TIMEOUT_S = {{.Timeout}};
@@ -94,7 +94,11 @@ function addLine(cls, text) {
   if (!SHOW_LOGS) return;
   const line = document.createElement('div');
   line.className = 'line ' + (cls || '');
-  line.innerHTML = '<span class="ts">[' + ts() + ']</span> ' + text;
+  const tsSpan = document.createElement('span');
+  tsSpan.className = 'ts';
+  tsSpan.textContent = '[' + ts() + ']';
+  line.appendChild(tsSpan);
+  line.appendChild(document.createTextNode(' ' + text));
   log.appendChild(line);
   log.scrollTop = log.scrollHeight;
 }
@@ -152,12 +156,15 @@ function showFailed() {
     '<div class="icon">✗</div>' +
     '<h2>Startup timed out</h2>' +
     '<p>{{.Title}} did not become ready within ' + TIMEOUT_S + ' seconds.</p>' +
-    '<button class="btn" onclick="retry()">Retry</button>' +
+    '<button class="btn" id="retry">Retry</button>' +
   '</div>';
+  document.getElementById('retry').addEventListener('click', retry);
 }
 
 function retry() {
-  window.location.reload();
+  stopped = false;
+  fetch('/_docknap/wait/{{.Subdomain}}?retry=1', { cache: 'no-store' })
+    .finally(() => window.location.reload());
 }
 
 setTimeout(poll, 300);

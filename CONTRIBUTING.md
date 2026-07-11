@@ -4,13 +4,13 @@ Thanks for your interest in contributing! docknap is a small, focused project an
 
 ## Code of conduct
 
-Be respectful. Assume good faith. This project follows the spirit of the [Contributor Covenant](https://www.contributor-covenant.org/version/2/1/code_of_conduct/).
+Be respectful. Assume good faith. This project follows the [Contributor Covenant Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Filing issues
 
 Use the [issue templates](https://github.com/EkmalRey/docknap/issues/new/choose). For bugs, include:
 
-- docknap version (`docknap_version` field in `/_docknap/status` output)
+- docknap version (output of `curl -s http://docknap:8000/_docknap/version | jq .version`)
 - Docker version (`docker --version`)
 - Your `docker-compose.yml` (or equivalent)
 - Relevant logs (`docker logs docknap`)
@@ -21,7 +21,7 @@ Use the [issue templates](https://github.com/EkmalRey/docknap/issues/new/choose)
 1. Fork the repository
 2. Create a feature branch: `git checkout -b feature/my-change`
 3. Make your changes
-4. Run `go vet ./...` and `go test ./...` — both must pass
+4. Run `go vet ./...`, `golangci-lint run`, `go test -race ./...` — all must pass
 5. Keep commits focused; squash noise commits before requesting review
 6. Push your branch and open a PR
 
@@ -41,10 +41,13 @@ The example compose starts docknap on port 8000 and a demo nginx container with 
 ## Testing
 
 ```bash
-go test ./...
+go test -race ./...          # unit tests (logger, metrics, label parser, subdomain, CSRF, middleware)
+golangci-lint run            # static analysis (staticcheck, gosec, errcheck, ...)
+tests/integration/run.sh    # end-to-end: real Docker, lazy-start + idle-stop
 ```
 
-The test suite covers the logger, metrics registry, label parser, subdomain extraction, and theme/theme-fallback logic. Aim for new tests when adding non-trivial behavior.
+Aim for new unit tests when adding non-trivial behavior. The integration script
+needs a working Docker daemon and exercises the full lazy-start/idle-stop flow.
 
 ## Code style
 
@@ -68,7 +71,7 @@ If your change affects user-facing behavior (labels, env vars, endpoints, metric
 
 Maintainers tag releases with `vX.Y.Z` (semver). Pushing the tag triggers the release workflow which:
 
-1. Runs `go vet` and `go test`
+1. Runs a `verify` job (vet + `go test -race` + lint) that gates the build
 2. Builds multi-arch images (linux/amd64, linux/arm64)
 3. Pushes to `ghcr.io/ekmalrey/docknap:X.Y.Z` and `:latest` (lowercase per GHCR / Go module rules)
 4. Creates a GitHub release with auto-generated notes
@@ -79,11 +82,23 @@ If you're a maintainer, ensure the CHANGELOG is updated before tagging.
 
 | File | Purpose |
 |------|---------|
-| `main.go` | HTTP server, label parsing, lifecycle management |
-| `admin.go` | Admin UI HTML + JavaScript |
-| `auth.go` | HTTP Basic Auth middleware |
-| `logger.go` | Structured text/JSON logger |
+| `main.go` | Entry point, server wiring, signal handling |
+| `docker.go` | Docker event subscription, poll fallback, container sync/reconcile |
+| `registry.go` | In-memory service registry and config state |
+| `timers.go` | Idle-stop timers and stop/start orchestration |
+| `config.go` | Label and env parsing/validation |
+| `proxy.go` | Reverse proxy + WebSocket/streaming upgrade handling |
+| `auth.go` | Basic auth, session cookies, CSRF protection |
+| `sessions.go` | Login session store |
+| `handlers_*.go` | HTTP handlers (actions, admin UI, status) |
+| `logs.go` | Container log tailer + SSE stream |
 | `metrics.go` | Prometheus registry (counters, gauges, histograms) |
+| `notifier.go` / `webhooks.go` | Start/stop notifications and webhooks |
+| `templates.go` + `templates/` | Admin UI + loading page HTML |
+| `middleware.go` | Security/recovery middleware |
+| `logger.go` | Structured text/JSON logger |
+| `cidr.go` / `ratelimit.go` / `subdomain.go` | Helpers (trusted proxies, rate limiting, subdomain extraction) |
+| `tests/integration/` | End-to-end Docker integration test |
 | `*_test.go` | Unit tests |
 
 ## License

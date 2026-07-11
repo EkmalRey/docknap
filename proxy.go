@@ -73,7 +73,7 @@ func (s *Docknap) handleProxy(w http.ResponseWriter, r *http.Request) {
 	cfg, ok := s.configs[sub]
 	s.mu.RUnlock()
 	if !ok {
-		http.Error(w, fmt.Sprintf("unknown service: %s", sub), http.StatusNotFound)
+		s.renderNotFound(w, r, sub)
 		return
 	}
 

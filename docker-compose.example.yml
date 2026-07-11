@@ -1,16 +1,20 @@
-version: "3.9"
-
 services:
   docknap:
-    build: .
-    image: ghcr.io/ekmalrey/docknap:latest
+    # Pick ONE: build locally or pull the published image. Do not set both.
+    image: ghcr.io/ekmalrey/docknap:0.1.0
+    # build: .
     container_name: docknap
     restart: unless-stopped
-    # docknap needs read+write access to the Docker socket to start and stop
-    # managed containers. Anyone who can reach docknap's port (8000) effectively
-    # has full container management on this host. Always put docknap behind a
-    # reverse proxy with TLS, and set DOCKNAP_ADMIN_USER / DOCKNAP_ADMIN_PASS
-    # if you expose it beyond localhost.
+    # The image runs as an unprivileged user, but /var/run/docker.sock is
+    # normally root:docker 0660. Pass the docker group GID via group_add
+    # so docknap can read/write the socket. Find your host GID:
+    #   getent group docker | cut -d: -f3
+    group_add:
+      - "999"  # host docker GID; adjust to match your system
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
@@ -60,4 +64,3 @@ networks:
 #    the .env file to git. Use a strong random password (e.g. `openssl rand -hex 24`).
 # 3. The Docker socket mount gives docknap root-equivalent control over the host.
 #    Treat the docknap port as equivalent to shell access on this host.
-

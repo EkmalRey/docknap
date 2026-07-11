@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strconv"
 	"sync"
 )
 
@@ -110,7 +111,7 @@ func labelList(names []string, labels map[string]string) string {
 		if i > 0 {
 			s += ","
 		}
-		s += n + "=" + labels[n]
+		s += n + "=" + strconv.Quote(labels[n])
 	}
 	return s
 }
@@ -158,6 +159,26 @@ func (c *Counter) Add(labels map[string]string, v float64) {
 	c.r.mu.Unlock()
 }
 
+func (c *Counter) Delete(labels map[string]string) {
+	k := labelKey(c.m.labels, labels)
+	c.r.mu.Lock()
+	delete(c.m.values, k)
+	c.r.mu.Unlock()
+}
+
+// DeletePrefix removes all series whose label key starts with the given prefix.
+// Used to clean up all reason variants for a subdomain when a service is removed.
+func (c *Counter) DeletePrefix(subdomain string) {
+	c.r.mu.Lock()
+	for k := range c.m.values {
+		labels := parseKey(c.m.labels, k)
+		if labels["subdomain"] == subdomain {
+			delete(c.m.values, k)
+		}
+	}
+	c.r.mu.Unlock()
+}
+
 type Gauge struct {
 	r *Registry
 	m *metric
@@ -174,6 +195,25 @@ func (g *Gauge) Add(labels map[string]string, v float64) {
 	k := labelKey(g.m.labels, labels)
 	g.r.mu.Lock()
 	g.m.values[k] += v
+	g.r.mu.Unlock()
+}
+
+func (g *Gauge) Delete(labels map[string]string) {
+	k := labelKey(g.m.labels, labels)
+	g.r.mu.Lock()
+	delete(g.m.values, k)
+	g.r.mu.Unlock()
+}
+
+// DeletePrefix removes all series whose label key starts with the given prefix.
+func (g *Gauge) DeletePrefix(subdomain string) {
+	g.r.mu.Lock()
+	for k := range g.m.values {
+		labels := parseKey(g.m.labels, k)
+		if labels["subdomain"] == subdomain {
+			delete(g.m.values, k)
+		}
+	}
 	g.r.mu.Unlock()
 }
 
@@ -195,6 +235,29 @@ func (h *Histogram) Observe(labels map[string]string, v float64) {
 	for i, b := range h.h.buckets {
 		if v <= b {
 			bucketCounts[i]++
+		}
+	}
+	h.r.mu.Unlock()
+}
+
+func (h *Histogram) Delete(labels map[string]string) {
+	k := labelKey(h.h.labels, labels)
+	h.r.mu.Lock()
+	delete(h.h.sums, k)
+	delete(h.h.counts, k)
+	delete(h.h.bcount, k)
+	h.r.mu.Unlock()
+}
+
+// DeletePrefix removes all series whose label key starts with the given prefix.
+func (h *Histogram) DeletePrefix(subdomain string) {
+	h.r.mu.Lock()
+	for k := range h.h.counts {
+		labels := parseKey(h.h.labels, k)
+		if labels["subdomain"] == subdomain {
+			delete(h.h.sums, k)
+			delete(h.h.counts, k)
+			delete(h.h.bcount, k)
 		}
 	}
 	h.r.mu.Unlock()
@@ -225,11 +288,11 @@ func (r *Registry) writeTo(w io.Writer, subdomain string) {
 		if subdomain != "" && !hasLabel(m.labels, "subdomain") {
 			continue
 		}
-		fmt.Fprintf(w, "# HELP %s %s\n", m.name, m.help)
-		fmt.Fprintf(w, "# TYPE %s %s\n", m.name, kindName(m.kind))
+		_, _ = fmt.Fprintf(w, "# HELP %s %s\n", m.name, m.help)
+		_, _ = fmt.Fprintf(w, "# TYPE %s %s\n", m.name, kindName(m.kind))
 		if len(m.values) == 0 {
 			if len(m.labels) == 0 {
-				fmt.Fprintf(w, "%s 0\n", m.name)
+				_, _ = fmt.Fprintf(w, "%s 0\n", m.name)
 			}
 			continue
 		}
@@ -240,9 +303,9 @@ func (r *Registry) writeTo(w io.Writer, subdomain string) {
 				continue
 			}
 			if len(labels) == 0 {
-				fmt.Fprintf(w, "%s %g\n", m.name, m.values[k])
+				_, _ = fmt.Fprintf(w, "%s %g\n", m.name, m.values[k])
 			} else {
-				fmt.Fprintf(w, "%s{%s} %g\n", m.name, labelList(m.labels, labels), m.values[k])
+				_, _ = fmt.Fprintf(w, "%s{%s} %g\n", m.name, labelList(m.labels, labels), m.values[k])
 			}
 		}
 	}
@@ -251,8 +314,8 @@ func (r *Registry) writeTo(w io.Writer, subdomain string) {
 		if subdomain != "" && !hasLabel(h.labels, "subdomain") {
 			continue
 		}
-		fmt.Fprintf(w, "# HELP %s %s\n", h.name, h.help)
-		fmt.Fprintf(w, "# TYPE %s histogram\n", h.name)
+		_, _ = fmt.Fprintf(w, "# HELP %s %s\n", h.name, h.help)
+		_, _ = fmt.Fprintf(w, "# TYPE %s histogram\n", h.name)
 		keys := sortedKeysUint(h.counts)
 		for _, k := range keys {
 			labels := parseKey(h.labels, k)
@@ -261,12 +324,12 @@ func (r *Registry) writeTo(w io.Writer, subdomain string) {
 			}
 			for i, b := range h.buckets {
 				lbls := addBucketLabel(labels, le(b))
-				fmt.Fprintf(w, "%s_bucket{%s} %d\n", h.name, lbls, h.bcount[k][i])
+				_, _ = fmt.Fprintf(w, "%s_bucket{%s} %d\n", h.name, lbls, h.bcount[k][i])
 			}
 			lbls := addBucketLabel(labels, "+Inf")
-			fmt.Fprintf(w, "%s_bucket{%s} %d\n", h.name, lbls, h.counts[k])
-			fmt.Fprintf(w, "%s_sum{%s} %g\n", h.name, labelList(h.labels, labels), h.sums[k])
-			fmt.Fprintf(w, "%s_count{%s} %d\n", h.name, labelList(h.labels, labels), h.counts[k])
+			_, _ = fmt.Fprintf(w, "%s_bucket{%s} %d\n", h.name, lbls, h.counts[k])
+			_, _ = fmt.Fprintf(w, "%s_sum{%s} %g\n", h.name, labelList(h.labels, labels), h.sums[k])
+			_, _ = fmt.Fprintf(w, "%s_count{%s} %d\n", h.name, labelList(h.labels, labels), h.counts[k])
 		}
 	}
 }
@@ -335,12 +398,12 @@ func addBucketLabel(labels map[string]string, leVal string) string {
 			s += ","
 		}
 		first = false
-		s += k + "=" + labels[k]
+		s += k + "=" + strconv.Quote(labels[k])
 	}
 	if !first {
 		s += ","
 	}
-	s += "le=" + leVal
+	s += "le=" + strconv.Quote(leVal)
 	return s
 }
 

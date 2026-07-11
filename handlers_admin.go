@@ -35,7 +35,7 @@ func (s *Docknap) handleReadyz(w http.ResponseWriter, r *http.Request) {
 func (s *Docknap) handleVersion(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{
-		"version":   version,
+		"version":    version,
 		"go_version": runtime.Version(),
 	})
 }
@@ -78,4 +78,4 @@ func (s *Docknap) renderAdminCtx(w http.ResponseWriter, r *http.Request) (csrfTo
 type atomicBool struct{ v atomic.Bool }
 
 func (a *atomicBool) set(b bool) { a.v.Store(b) }
-func (a *atomicBool) get() bool   { return a.v.Load() }
+func (a *atomicBool) get() bool  { return a.v.Load() }

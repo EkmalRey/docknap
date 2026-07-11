@@ -44,6 +44,22 @@ func TestRecoverMiddlewarePassesThrough(t *testing.T) {
 	}
 }
 
+func TestSecurityHeadersRejectsNonceFailure(t *testing.T) {
+	old := nonceReader
+	nonceReader = strings.NewReader("")
+	t.Cleanup(func() { nonceReader = old })
+	rr := httptest.NewRecorder()
+	securityHeaders(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("handler called")
+	})).ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rr.Code)
+	}
+	if strings.Contains(rr.Header().Get("Content-Security-Policy"), "docknap") {
+		t.Fatal("predictable nonce rendered")
+	}
+}
+
 func TestWebhookQueueDropOnFull(t *testing.T) {
 	// Build a webhookSender whose target never responds, so the queue
 	// worker is busy while we spam events.
@@ -85,7 +101,8 @@ func TestWebhookQueueDropOnFull(t *testing.T) {
 
 func TestClientKeyUsesXFFBehindTrustedProxy(t *testing.T) {
 	s := newAuthTestDocknap(t)
-	s.trustedProxies = parseTrustedProxies("10.0.0.0/8")
+	tp, _ := parseTrustedProxies("10.0.0.0/8")
+	s.trustedProxies = tp
 	r := httptest.NewRequest("GET", "/", nil)
 	r.RemoteAddr = "10.0.0.5:1234"
 	r.Header.Set("X-Forwarded-For", "203.0.113.5, 10.0.0.5")

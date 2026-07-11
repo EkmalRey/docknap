@@ -1,6 +1,10 @@
 package main
 
 import (
+	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"io"
 	"net/http"
 	"runtime/debug"
 )
@@ -35,4 +39,48 @@ func anyToString(v any) string {
 		return e.Error()
 	}
 	return "non-string panic"
+}
+
+type ctxKey int
+
+const nonceKey ctxKey = iota
+
+// requestNonce returns the per-request CSP nonce generated in securityHeaders.
+func requestNonce(r *http.Request) string {
+	if n, ok := r.Context().Value(nonceKey).(string); ok {
+		return n
+	}
+	return ""
+}
+
+// securityHeaders sets baseline browser hardening headers on every response.
+// A fresh per-request nonce is minted and required for inline scripts, so the
+// CSP actually constrains script execution (audit #13) rather than allowing
+// 'unsafe-inline' everywhere.
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		nonce, err := makeNonce()
+		if err != nil {
+			http.Error(w, "internal server error", http.StatusInternalServerError)
+			return
+		}
+		r = r.WithContext(context.WithValue(r.Context(), nonceKey, nonce))
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "no-referrer")
+		h.Set("Content-Security-Policy",
+			"default-src 'self'; script-src 'self' 'nonce-"+nonce+"'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
+		next.ServeHTTP(w, r)
+	})
+}
+
+var nonceReader io.Reader = rand.Reader
+
+func makeNonce() (string, error) {
+	b := make([]byte, 16)
+	if _, err := io.ReadFull(nonceReader, b); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
 }

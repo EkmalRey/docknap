@@ -1,6 +1,13 @@
 .git
 .github
 examples
+tests
+coverage.*
+docknap
+docknap-test
+*.test
+*.out
+*.exe
 *.md
 LICENSE
 CHANGELOG.md

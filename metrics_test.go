@@ -14,13 +14,24 @@ func TestCounter_BasicInc(t *testing.T) {
 	c.Inc(map[string]string{"path": "/a"})
 	c.Inc(map[string]string{"path": "/b"})
 	var buf bytes.Buffer
-	r.WriteTo(&buf)
+	_, _ = r.WriteTo(&buf)
 	out := buf.String()
-	if !strings.Contains(out, `hits_total{path=/a} 2`) {
+	if !strings.Contains(out, `hits_total{path="/a"} 2`) {
 		t.Errorf("missing /a count: %s", out)
 	}
-	if !strings.Contains(out, `hits_total{path=/b} 1`) {
+	if !strings.Contains(out, `hits_total{path="/b"} 1`) {
 		t.Errorf("missing /b count: %s", out)
+	}
+}
+
+func TestRegistry_QuotesAndEscapesLabelValues(t *testing.T) {
+	r := NewRegistry()
+	c := r.Counter("hits_total", "hits", []string{"path"})
+	c.Inc(map[string]string{"path": "a\\b\n\"c"})
+	var buf bytes.Buffer
+	_, _ = r.WriteTo(&buf)
+	if !strings.Contains(buf.String(), `hits_total{path="a\\b\n\"c"} 1`) {
+		t.Fatalf("invalid label encoding: %s", buf.String())
 	}
 }
 
@@ -29,8 +40,8 @@ func TestCounter_AddNonOne(t *testing.T) {
 	c := r.Counter("bytes_total", "bytes", []string{"path"})
 	c.Add(map[string]string{"path": "/a"}, 1024)
 	var buf bytes.Buffer
-	r.WriteTo(&buf)
-	if !strings.Contains(buf.String(), `bytes_total{path=/a} 1024`) {
+	_, _ = r.WriteTo(&buf)
+	if !strings.Contains(buf.String(), `bytes_total{path="/a"} 1024`) {
 		t.Errorf("expected 1024, got: %s", buf.String())
 	}
 }
@@ -42,12 +53,12 @@ func TestCounter_LabelOrderIndependent(t *testing.T) {
 	c.Inc(map[string]string{"b": "2", "a": "1"})
 	c.Inc(map[string]string{"a": "1", "b": "3"})
 	var buf bytes.Buffer
-	r.WriteTo(&buf)
+	_, _ = r.WriteTo(&buf)
 	out := buf.String()
-	if !strings.Contains(out, `hits_total{a=1,b=2} 2`) {
+	if !strings.Contains(out, `hits_total{a="1",b="2"} 2`) {
 		t.Errorf("expected merged a=1,b=2 count of 2: %s", out)
 	}
-	if !strings.Contains(out, `hits_total{a=1,b=3} 1`) {
+	if !strings.Contains(out, `hits_total{a="1",b="3"} 1`) {
 		t.Errorf("expected a=1,b=3 count of 1: %s", out)
 	}
 }
@@ -58,8 +69,8 @@ func TestGauge_SetAndAdd(t *testing.T) {
 	g.Set(map[string]string{"room": "kitchen"}, 22.5)
 	g.Add(map[string]string{"room": "kitchen"}, -0.5)
 	var buf bytes.Buffer
-	r.WriteTo(&buf)
-	if !strings.Contains(buf.String(), `temp{room=kitchen} 22`) {
+	_, _ = r.WriteTo(&buf)
+	if !strings.Contains(buf.String(), `temp{room="kitchen"} 22`) {
 		t.Errorf("expected temp=22, got: %s", buf.String())
 	}
 }
@@ -69,7 +80,7 @@ func TestGauge_NoLabels(t *testing.T) {
 	g := r.Gauge("up", "up", nil)
 	g.Set(nil, 1)
 	var buf bytes.Buffer
-	r.WriteTo(&buf)
+	_, _ = r.WriteTo(&buf)
 	if !strings.Contains(buf.String(), "up 1") {
 		t.Errorf("expected 'up 1', got: %s", buf.String())
 	}
@@ -82,22 +93,22 @@ func TestHistogram_BucketCounts(t *testing.T) {
 		h.Observe(map[string]string{"op": "test"}, v)
 	}
 	var buf bytes.Buffer
-	r.WriteTo(&buf)
+	_, _ = r.WriteTo(&buf)
 	out := buf.String()
 	expects := []string{
-		`latency_seconds_bucket{op=test,le=0.1} 1`,
-		`latency_seconds_bucket{op=test,le=0.5} 2`,
-		`latency_seconds_bucket{op=test,le=1} 3`,
-		`latency_seconds_bucket{op=test,le=5} 4`,
-		`latency_seconds_bucket{op=test,le=+Inf} 5`,
-		`latency_seconds_count{op=test} 5`,
+		`latency_seconds_bucket{op="test",le="0.1"} 1`,
+		`latency_seconds_bucket{op="test",le="0.5"} 2`,
+		`latency_seconds_bucket{op="test",le="1"} 3`,
+		`latency_seconds_bucket{op="test",le="5"} 4`,
+		`latency_seconds_bucket{op="test",le="+Inf"} 5`,
+		`latency_seconds_count{op="test"} 5`,
 	}
 	for _, want := range expects {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing %q in:\n%s", want, out)
 		}
 	}
-	if !strings.Contains(out, `latency_seconds_sum{op=test} 8.85`) {
+	if !strings.Contains(out, `latency_seconds_sum{op="test"} 8.85`) {
 		t.Errorf("expected sum=8.85, got: %s", out)
 	}
 }
@@ -115,8 +126,8 @@ func TestRegistry_ConcurrentInc(t *testing.T) {
 	}
 	wg.Wait()
 	var buf bytes.Buffer
-	r.WriteTo(&buf)
-	if !strings.Contains(buf.String(), "reqs_total{path=/x} 100") {
+	_, _ = r.WriteTo(&buf)
+	if !strings.Contains(buf.String(), `reqs_total{path="/x"} 100`) {
 		t.Errorf("expected 100 increments, got: %s", buf.String())
 	}
 }
@@ -130,10 +141,10 @@ func TestRegistry_FilteredBySubdomain(t *testing.T) {
 	var buf bytes.Buffer
 	r.WriteToFiltered(&buf, "b")
 	out := buf.String()
-	if strings.Contains(out, `subdomain=a`) {
+	if strings.Contains(out, `subdomain="a"`) {
 		t.Errorf("a should be filtered out: %s", out)
 	}
-	if !strings.Contains(out, `hits{subdomain=b} 2`) {
+	if !strings.Contains(out, `hits{subdomain="b"} 2`) {
 		t.Errorf("expected b=2: %s", out)
 	}
 }

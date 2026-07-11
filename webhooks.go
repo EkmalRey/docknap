@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -133,7 +133,8 @@ func (w *webhookSender) send(ev webhookEvent) {
 		defaultLogger.Debug("webhook send failed", F("event", ev.Event), F("err", err.Error()))
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64*1024))
 	if resp.StatusCode >= 300 {
 		defaultLogger.Debug("webhook non-2xx", F("event", ev.Event), F("status", resp.StatusCode))
 	}
@@ -143,15 +144,6 @@ func (w *webhookSender) shutdown() {
 	if w == nil {
 		return
 	}
-	w.cancel()
 	close(w.stop)
 	w.wg.Wait()
-}
-
-func envOrBool(key string, fallback bool) bool {
-	v := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
-	if v == "" {
-		return fallback
-	}
-	return v == "true" || v == "1" || v == "yes" || v == "on"
 }

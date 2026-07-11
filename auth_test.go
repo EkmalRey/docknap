@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/base64"
+	"html"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -68,9 +69,13 @@ func TestParseBasicAuth(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			u, p, ok := parseBasicAuth(c.header)
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			if c.header != "" {
+				req.Header.Set("Authorization", c.header)
+			}
+			u, p, ok := req.BasicAuth()
 			if ok != c.wantOK || u != c.wantU || p != c.wantP {
-				t.Errorf("parseBasicAuth(%q) = (%q, %q, %v), want (%q, %q, %v)",
+				t.Errorf("BasicAuth(%q) = (%q, %q, %v), want (%q, %q, %v)",
 					c.header, u, p, ok, c.wantU, c.wantP, c.wantOK)
 			}
 		})
@@ -99,10 +104,10 @@ func TestSafeRedirect(t *testing.T) {
 
 func TestHtmlEscape(t *testing.T) {
 	in := `<a href="x">&'"\u2028`
-	want := `&lt;a href=&quot;x&quot;&gt;&amp;&#39;`
-	got := htmlEscape(in)
+	want := `&lt;a href=&#34;x&#34;&gt;&amp;&#39;`
+	got := html.EscapeString(in)
 	if !strings.HasPrefix(got, want) {
-		t.Errorf("htmlEscape(%q) = %q, want prefix %q", in, got, want)
+		t.Errorf("html.EscapeString(%q) = %q, want prefix %q", in, got, want)
 	}
 }
 
@@ -417,9 +422,57 @@ func TestHandleLogoutRejectsGET(t *testing.T) {
 	}
 }
 
+func TestSameOriginRequest(t *testing.T) {
+	for name, tc := range map[string]struct {
+		origin string
+		site   string
+		want   bool
+	}{
+		"same origin": {"https://admin.example.com", "same-origin", true},
+		"sibling":     {"https://evil.example.com", "same-site", false},
+		"scheme":      {"http://admin.example.com", "", false},
+		"port":        {"https://admin.example.com:444", "", false},
+		"api":         {"", "", true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodPost, "https://admin.example.com/action", nil)
+			r.Host = "admin.example.com"
+			r.Header.Set("Origin", tc.origin)
+			r.Header.Set("Sec-Fetch-Site", tc.site)
+			if got := newAuthTestDocknap(t).sameSiteRequest(r); got != tc.want {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSameOriginIgnoresUntrustedForwardedProto(t *testing.T) {
+	s := newAuthTestDocknap(t)
+	tp, _ := parseTrustedProxies("10.0.0.0/8")
+	s.trustedProxies = tp
+	r := httptest.NewRequest(http.MethodPost, "http://admin.example/action", nil)
+	r.RemoteAddr = "8.8.8.8:1234"
+	r.Header.Set("Origin", "https://admin.example")
+	r.Header.Set("X-Forwarded-Proto", "https")
+	if s.sameSiteRequest(r) {
+		t.Error("untrusted forwarded proto must not change the request origin")
+	}
+}
+
+func TestSameOriginNormalizesDefaultPort(t *testing.T) {
+	s := newAuthTestDocknap(t)
+	r := httptest.NewRequest(http.MethodPost, "https://admin.example/action", nil)
+	r.Host = "admin.example:443"
+	r.Header.Set("Origin", "https://ADMIN.EXAMPLE")
+	if !s.sameSiteRequest(r) {
+		t.Error("equivalent HTTPS origins should match")
+	}
+}
+
 func TestRequestIsHTTPS(t *testing.T) {
 	s := newAuthTestDocknap(t)
-	s.trustedProxies = parseTrustedProxies("10.0.0.0/8")
+	tp, _ := parseTrustedProxies("10.0.0.0/8")
+	s.trustedProxies = tp
 	mkReq := func() *http.Request {
 		r := httptest.NewRequest("GET", "/", nil)
 		r.RemoteAddr = "10.0.0.5:1234"

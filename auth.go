@@ -3,7 +3,7 @@ package main
 import (
 	"crypto/sha256"
 	"crypto/subtle"
-	"encoding/base64"
+	"html"
 	"net"
 	"net/http"
 	"net/url"
@@ -20,6 +20,9 @@ const (
 	authCookieMaxAge = 12 * time.Hour
 	loginPath        = "/_docknap/auth/login"
 	logoutPath       = "/_docknap/auth/logout"
+	// authMetricRoute is the bounded category for AuthFail counters.
+	// ponytail: single value instead of per-path labels — avoids unbounded cardinality.
+	authMetricRoute = "admin_auth"
 )
 
 func (s *Docknap) authEnabled() bool {
@@ -63,9 +66,21 @@ func (s *Docknap) requireCSRF(next http.HandlerFunc) http.HandlerFunc {
 			next(w, r)
 			return
 		}
-		// Only enforce CSRF when a session-cookie login is in use. Basic-auth
-		// requests are authenticated by the Authorization header, which an
-		// attacker cannot forge cross-origin.
+		// Reject cross-site browser requests for state-changing endpoints
+		// regardless of auth method. Browsers always send Sec-Fetch-Site (and,
+		// for cross-origin POSTs, an Origin header); a same-origin admin UI or
+		// a non-browser API client passes. This closes the Basic-auth CSRF gap
+		// where cached credentials are attached to a cross-origin form post
+		// (audit #5).
+		if !s.sameSiteRequest(r) {
+			s.logger.Warn("csrf rejected: cross-site request",
+				F("path", r.URL.Path), F("remote", r.RemoteAddr),
+				F("origin", r.Header.Get("Origin")), F("site", r.Header.Get("Sec-Fetch-Site")))
+			http.Error(w, "cross-site request rejected", http.StatusForbidden)
+			return
+		}
+		// Cookie-session logins still require a matching CSRF token; Basic-auth
+		// same-site requests are allowed through (no token to echo).
 		if r.Header.Get("Authorization") != "" {
 			next(w, r)
 			return
@@ -91,8 +106,42 @@ func (s *Docknap) requireCSRF(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// sameSiteRequest reports whether r is same-site for CSRF purposes. Modern
+// browsers send Sec-Fetch-Site; absent that, an Origin header that matches the
+// request host is same-site. A request with no fetch metadata (curl, old
+// clients, API scripts) is treated as same-site and allowed.
+func (s *Docknap) sameSiteRequest(r *http.Request) bool {
+	if site := r.Header.Get("Sec-Fetch-Site"); site != "" && site != "same-origin" {
+		return false
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return false
+	}
+	scheme := "http"
+	if s.requestIsHTTPS(r) {
+		scheme = "https"
+	}
+	originPort, requestPort := u.Port(), ""
+	requestHost, requestPort, err := net.SplitHostPort(r.Host)
+	if err != nil {
+		requestHost = r.Host
+	}
+	if originPort == "" {
+		originPort = map[string]string{"http": "80", "https": "443"}[strings.ToLower(u.Scheme)]
+	}
+	if requestPort == "" {
+		requestPort = map[string]string{"http": "80", "https": "443"}[scheme]
+	}
+	return strings.EqualFold(u.Scheme, scheme) && strings.EqualFold(u.Hostname(), requestHost) && originPort == requestPort
+}
+
 func (s *Docknap) checkRequestAuth(r *http.Request) bool {
-	if user, pass, ok := parseBasicAuth(r.Header.Get("Authorization")); ok {
+	if user, pass, ok := r.BasicAuth(); ok {
 		return s.verifyCredentials(user, pass)
 	}
 	if cookie, err := r.Cookie(authCookieName); err == nil && cookie.Value != "" {
@@ -101,25 +150,9 @@ func (s *Docknap) checkRequestAuth(r *http.Request) bool {
 	return false
 }
 
-func parseBasicAuth(header string) (user, pass string, ok bool) {
-	const prefix = "Basic "
-	if !strings.HasPrefix(header, prefix) {
-		return "", "", false
-	}
-	decoded, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(header, prefix))
-	if err != nil {
-		return "", "", false
-	}
-	user, pass, ok = strings.Cut(string(decoded), ":")
-	if !ok {
-		return "", "", false
-	}
-	return user, pass, true
-}
-
 func (s *Docknap) failAuth(w http.ResponseWriter, r *http.Request, reason string) {
 	if s.m.AuthFail != nil {
-		s.m.AuthFail.Add(map[string]string{"path": r.URL.Path, "reason": reason}, 1)
+		s.m.AuthFail.Add(map[string]string{"path": authMetricRoute, "reason": reason}, 1)
 	}
 	s.logger.Warn("auth failed", F("path", r.URL.Path), F("reason", reason), F("remote", r.RemoteAddr))
 	s.serveLogin(w, r, "invalid")
@@ -150,9 +183,10 @@ func (s *Docknap) handleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Docknap) processLogin(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
 	remoteKey := s.clientKey(r)
 	if !s.rateLimiter.allow(remoteKey) {
-		s.m.AuthFail.Add(map[string]string{"path": r.URL.Path, "reason": "rate_limited"}, 1)
+		s.m.AuthFail.Add(map[string]string{"path": authMetricRoute, "reason": "rate_limited"}, 1)
 		s.logger.Warn("login rate-limited", F("remote", r.RemoteAddr))
 		s.failLogin(w, r, "", "rate_limited")
 		return
@@ -171,7 +205,7 @@ func (s *Docknap) processLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !s.verifyCredentials(user, pass) {
-		s.m.AuthFail.Add(map[string]string{"path": r.URL.Path, "reason": "invalid"}, 1)
+		s.m.AuthFail.Add(map[string]string{"path": authMetricRoute, "reason": "invalid"}, 1)
 		s.logger.Warn("auth failed",
 			F("path", r.URL.Path),
 			F("reason", "invalid"),
@@ -215,9 +249,31 @@ func (s *Docknap) processLogin(w http.ResponseWriter, r *http.Request) {
 
 func (s *Docknap) clientKey(r *http.Request) string {
 	if s.trustedProxy(r) {
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			if first := strings.TrimSpace(strings.Split(xff, ",")[0]); first != "" {
-				return first
+		// Walk X-Forwarded-For right-to-left, skipping trusted proxy hops that
+		// legitimately append. The first untrusted IP is the real client, so a
+		// proxy that appends (rather than overwrites) cannot smuggle spoofed
+		// values past the trusted boundary (audit #20).
+		parts := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
+		for i := len(parts) - 1; i >= 0; i-- {
+			ip := net.ParseIP(strings.TrimSpace(parts[i]))
+			if ip == nil {
+				continue
+			}
+			trusted := false
+			for _, c := range s.trustedProxies {
+				if c.contains(ip) {
+					trusted = true
+					break
+				}
+			}
+			if !trusted {
+				return ip.String()
+			}
+		}
+		// All hops are trusted proxies; fall back to the leftmost original value.
+		for _, p := range parts {
+			if v := strings.TrimSpace(p); v != "" {
+				return v
 			}
 		}
 	}
@@ -313,16 +369,5 @@ func loginErrorBlock(errCode string) string {
 	default:
 		friendly = errCode
 	}
-	return `<div class="err">[!] ` + htmlEscape(friendly) + `</div>`
-}
-
-func htmlEscape(s string) string {
-	r := strings.NewReplacer(
-		"&", "&amp;",
-		"<", "&lt;",
-		">", "&gt;",
-		`"`, "&quot;",
-		"'", "&#39;",
-	)
-	return r.Replace(s)
+	return `<div class="err">[!] ` + html.EscapeString(friendly) + `</div>`
 }

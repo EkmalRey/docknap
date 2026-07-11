@@ -2,7 +2,7 @@ package main
 
 import (
 	"embed"
-	"fmt"
+	"encoding/json"
 	"html/template"
 	"net/http"
 	"strings"
@@ -29,6 +29,7 @@ type loadingData struct {
 	ShowLogs    string
 	ShowStats   string
 	BootLines   template.JS
+	Nonce       string
 }
 
 func (s *Docknap) serveLoading(w http.ResponseWriter, r *http.Request, cfg *Config) {
@@ -67,7 +68,7 @@ func (s *Docknap) serveLoading(w http.ResponseWriter, r *http.Request, cfg *Conf
 	if len(boot) == 0 {
 		boot = strings.Split(defaultBootMessages, "|")
 	}
-	bootJS := template.JS(bootJSON(boot))
+	bootJS := template.JS(bootJSON(boot)) //nolint:gosec // G203: boot messages are repository-owned config strings, not user input
 
 	data := loadingData{
 		Subdomain:   cfg.Subdomain,
@@ -83,25 +84,23 @@ func (s *Docknap) serveLoading(w http.ResponseWriter, r *http.Request, cfg *Conf
 		ShowLogs:    showLogs,
 		ShowStats:   showStats,
 		BootLines:   bootJS,
+		Nonce:       requestNonce(r),
 	}
 	_ = templates.ExecuteTemplate(w, "loading.html", data)
 }
 
 func bootJSON(boot []string) string {
-	out := "["
-	for i, b := range boot {
-		if i > 0 {
-			out += ","
-		}
-		out += fmt.Sprintf("%q", b)
+	b, err := json.Marshal(boot)
+	if err != nil {
+		return "[]"
 	}
-	out += "]"
-	return out
+	return string(b)
 }
 
 type adminData struct {
 	DocknapVersion string
 	CSRFToken      string
+	Nonce          string
 }
 
 type loginData struct {
@@ -120,6 +119,7 @@ func (s *Docknap) renderAdmin(w http.ResponseWriter, r *http.Request) {
 	_ = templates.ExecuteTemplate(w, "admin.html", adminData{
 		DocknapVersion: version,
 		CSRFToken:      s.renderAdminCtx(w, r),
+		Nonce:          requestNonce(r),
 	})
 }
 
@@ -131,7 +131,7 @@ func (s *Docknap) renderLogin(w http.ResponseWriter, r *http.Request, errCode, n
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusUnauthorized)
 	_ = templates.ExecuteTemplate(w, "login.html", loginData{
-		ErrBlock: template.HTML(loginErrorBlock(errCode)),
+		ErrBlock: template.HTML(loginErrorBlock(errCode)), //nolint:gosec // G203: error block is html.EscapeString'd inside loginErrorBlock
 		Next:     next,
 	})
 }

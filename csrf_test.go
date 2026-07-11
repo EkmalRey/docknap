@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -33,21 +34,30 @@ func TestCSRFBlocksPOSTWithoutToken(t *testing.T) {
 
 func TestCSRFAllowsPOSTWithMatchingToken(t *testing.T) {
 	s := newAuthTestDocknap(t)
-	s.configs["demo"] = &Config{Subdomain: "demo", Container: "demo-1", TargetPort: 80}
 	tok, csrf := csrfSession(t, s)
+
+	var invoked atomic.Int32
+	s.configs["demo"] = &Config{Subdomain: "demo", Container: "demo-1", TargetPort: 80}
+	recording := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		invoked.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("handled"))
+	})
 
 	rr := httptest.NewRecorder()
 	r := httptest.NewRequest("POST", "/_docknap/stop/demo", nil)
 	r.Header.Set("X-CSRF-Token", csrf)
 	r.Header.Set("Cookie", authCookieName+"="+tok+"; "+csrfCookieName+"="+tok)
-	// s.cli is nil, so handleStop will panic; that's fine — we only check
-	// the CSRF gate (which must not produce a 403).
-	func() {
-		defer func() { _ = recover() }()
-		s.requireAuth(s.requireCSRF(s.handleStop))(rr, r)
-	}()
-	if rr.Code == 403 {
-		t.Errorf("matching CSRF token was rejected, body: %s", rr.Body.String())
+	s.requireAuth(s.requireCSRF(recording))(rr, r)
+
+	if invoked.Load() != 1 {
+		t.Errorf("recording handler invoked %d times, want 1", invoked.Load())
+	}
+	if rr.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200, body: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "handled") {
+		t.Errorf("body = %q, want 'handled'", rr.Body.String())
 	}
 }
 
@@ -58,13 +68,24 @@ func TestCSRFAllowsBasicAuthWithoutToken(t *testing.T) {
 	s := newAuthTestDocknap(t)
 	s.configs["demo"] = &Config{Subdomain: "demo", Container: "demo-1", TargetPort: 80}
 
+	var invoked atomic.Int32
+	recording := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		invoked.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("handled"))
+	})
+
 	rr := httptest.NewRecorder()
 	r := httptest.NewRequest("POST", "/_docknap/stop/demo", nil)
 	r.Header.Set("Authorization", "Basic "+basicAuth("admin", "s3cret"))
-	func() {
-		defer func() { _ = recover() }()
-		s.requireAuth(s.requireCSRF(s.handleStop))(rr, r)
-	}()
+	s.requireAuth(s.requireCSRF(recording))(rr, r)
+
+	if invoked.Load() != 1 {
+		t.Errorf("recording handler invoked %d times, want 1", invoked.Load())
+	}
+	if rr.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200, body: %s", rr.Code, rr.Body.String())
+	}
 	if rr.Code == 403 {
 		t.Errorf("basic-auth request was rejected as CSRF, body: %s", rr.Body.String())
 	}
@@ -86,17 +107,28 @@ func TestCSRFRejectsMismatchedToken(t *testing.T) {
 
 func TestCSRFAllowsFormFieldToken(t *testing.T) {
 	s := newAuthTestDocknap(t)
-	s.configs["demo"] = &Config{Subdomain: "demo", Container: "demo-1", TargetPort: 80}
 	tok, csrf := csrfSession(t, s)
+	s.configs["demo"] = &Config{Subdomain: "demo", Container: "demo-1", TargetPort: 80}
+
+	var invoked atomic.Int32
+	recording := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		invoked.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("handled"))
+	})
 
 	rr := httptest.NewRecorder()
 	r := httptest.NewRequest("POST", "/_docknap/stop/demo", strings.NewReader("csrf="+csrf))
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	r.Header.Set("Cookie", authCookieName+"="+tok+"; "+csrfCookieName+"="+tok)
-	func() {
-		defer func() { _ = recover() }()
-		s.requireAuth(s.requireCSRF(s.handleStop))(rr, r)
-	}()
+	s.requireAuth(s.requireCSRF(recording))(rr, r)
+
+	if invoked.Load() != 1 {
+		t.Errorf("recording handler invoked %d times, want 1", invoked.Load())
+	}
+	if rr.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200, body: %s", rr.Code, rr.Body.String())
+	}
 	if rr.Code == 403 {
 		t.Errorf("form-field CSRF token was rejected, body: %s", rr.Body.String())
 	}

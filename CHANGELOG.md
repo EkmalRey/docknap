@@ -5,7 +5,38 @@ All notable changes to docknap will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.0] - 2026-06-04
+## [Unreleased]
+
+## [0.3.0] - 2026-07-11
+
+### Added
+- **Security response headers** on every response (CSP with a per-request script nonce, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`).
+- **`/healthz`-style readiness hardening:** `readyz` returns 503 (degraded) until container state has synced at least once, and while a poll-fallback re-sync is failing.
+- **CI:** golangci-lint upgraded to v2; added `govulncheck`, a real-Docker integration job, and Dependabot config.
+
+### Changed
+- **Login POST body is capped at 4 KiB** (`http.MaxBytesReader`).
+- **Live-log SSE streams are capped** at 50 concurrent subscribers per server.
+- **`/_docknap/wait/` is rate-limited** (30 req/min per client) since the loading page polls it.
+- **Login IP keying walks `X-Forwarded-For` right-to-left**, skipping trusted-proxy hops, and the limiter now prunes stale entries.
+- **Docs:** deployment/socket-permission guidance (`user: "0:0"` or `--group-add` for the docker GID), corrected `readyz` behavior, and refreshed `CONTRIBUTING.md` (file map, lint/race/integration testing).
+
+### Fixed
+- **Docker event/poll reconciliation** now removes stale subdomains, drops relabeled/duplicate containers, and invalidates the IP cache when a container's network-attach identity changes on (re)start. Idle timers are only armed for already-warmed, non-booting services.
+- **Idle-stop timer race:** a superseded timer can no longer stop a freshly-started container or delete a newer timer entry.
+- **Startup timeout is recorded once** per boot (no duplicate metrics).
+- **XSS in loading-page boot messages:** messages are HTML-escaped (server) and rendered via `textContent` (client).
+- **Label validation** rejects missing/invalid `docknap.target_port` and unknown `docknap.strategy`; invalid durations are rejected with an error.
+- **Log tailer lifecycle** re-opens the stream while subscribers remain and shuts down cleanly when refs hit zero.
+- **Stop APIs surface Docker errors** to the caller (HTTP 502) instead of silently succeeding.
+- **Docker socket permission mismatch** documented; examples no longer default to `user: "0:0"`.
+- **Re-audit cleanup.** Idle timers are now armed for services already running at discovery time (#1); running containers are re-inspected when their Docker ID changes so a restart drops the stale cached IP and re-arms the boot state (#2); duplicate subdomains are rejected entirely (all owners dropped) instead of picking a lexicographic winner (#10).
+- **`/_docknap/wait/`** reports the canonical startup-timeout flag even after `bootStarts` is cleared, so a genuinely timed-out boot can't be reported as "not yet" (#9); the rate limiter now only gates genuine new starts, not every loading-page poll (#12); a fresh start clears any stale `startupTimedOut` flag (#8).
+- **Log tailer:** a superseded generation can no longer cancel or delete a newer tailer on reconnect (#6), and reconnects stream live-only instead of replaying the last 40 lines each time (#7).
+- **CSRF** now rejects cross-site browser requests for all state-changing endpoints regardless of auth method (Basic-auth cross-site POSTs with cached credentials are blocked via `Sec-Fetch-Site`/`Origin`) (#5).
+- **CSP** now uses a per-request nonce instead of `unsafe-inline`, so inline scripts are actually constrained (#13).
+- **Dead code removed:** `parseBasicAuth` (→ `r.BasicAuth`), `htmlEscape` (→ `html.EscapeString`), `envOrBool`, `renderTemplate`, `snapshotServices`, `serviceStateCopy`'s unused fields (`LastSeen`/`StartedAt`/`IP`), and the unused `stopContainer` wrapper (#4).
+- **CI:** the integration network is declared `external` so Compose attaches to the pre-created network instead of conflicting (#3); the release `verify` job now also runs `govulncheck` and the integration harness (#14).
 
 ### Added
 - **CSRF protection** for all state-changing admin endpoints (`/_docknap/wake/`, `/_docknap/stop/`, `/_docknap/wake_all`, `/_docknap/stop_all`, `/_docknap/auth/logout`). A `docknap_csrf` cookie (`HttpOnly=false`) is set at login in addition to the session cookie. The admin UI sends the token as an `X-CSRF-Token` header on POSTs and the logout form embeds it as a hidden field. The check is skipped for `Authorization: Basic` requests (since the header is already an effective CSRF defense).
@@ -89,7 +120,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `?next=/path` is preserved across the login flow so a user hitting `/_docknap/status` directly is bounced through login and back. `next` is restricted to relative same-origin paths to prevent open redirects.
 
 ### Tests
-- New `auth_test.go` covering: `parseBasicAuth` (valid / wrong prefix / bad base64 / no colon), `safeRedirect` (open-redirect vectors), `verifyCredentials`, `checkRequestAuth` (header vs cookie, both, neither), `requireAuth` (disabled / valid header / no creds -> themed login / bad header -> login with error), `handleLogin` (GET unauthenticated / GET already-authenticated redirect / error query / bad method / POST valid / POST invalid / POST missing fields / POST open-redirect sanitization), `handleLogout` (POST clears cookie / GET rejected), and `requestIsHTTPS` (X-Forwarded-Proto).
+- New `auth_test.go` covering: Basic Auth parsing (valid / wrong prefix / bad base64 / no colon), `safeRedirect` (open-redirect vectors), `verifyCredentials`, `checkRequestAuth` (header vs cookie, both, neither), `requireAuth` (disabled / valid header / no creds -> themed login / bad header -> login with error), `handleLogin` (GET unauthenticated / GET already-authenticated redirect / error query / bad method / POST valid / POST invalid / POST missing fields / POST open-redirect sanitization), `handleLogout` (POST clears cookie / GET rejected), and `requestIsHTTPS` (X-Forwarded-Proto).
 
 ## [0.1.4] - 2026-06-02
 

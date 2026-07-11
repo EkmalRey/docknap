@@ -1,6 +1,6 @@
 services:
   nginx:
-    image: nginx:alpine
+    image: nginx:1.28-alpine
     container_name: nginx-demo
     labels:
       - "docknap.enable=true"

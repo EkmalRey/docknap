@@ -1,0 +1,3 @@
+# Docker Engine AuthZ bypass; docknap embeds only the Go API client and does not
+# run an Engine daemon or authorization plugins. Review on Docker SDK updates.
+CVE-2026-34040 exp:2026-10-01

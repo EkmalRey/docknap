@@ -28,7 +28,7 @@ What actually happened. Include any error messages verbatim.
 
 ## Environment
 
-- docknap version: (output of `curl http://docknap:8000/_docknap/status | jq .docknap_version`)
+- docknap version: (output of `curl -s http://docknap:8000/_docknap/version | jq .version`)
 - Docker version: (`docker --version`)
 - Host OS:
 - Architecture: (amd64 / arm64)

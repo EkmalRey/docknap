@@ -49,6 +49,7 @@ func TestParseLabelsStrategy(t *testing.T) {
 		"docknap.subdomain":   "x",
 		"docknap.target_port": "80",
 		"docknap.strategy":    "pause",
+		"docknap.health_path": "/health",
 	}
 	cfg, _ := s.parseLabels(labels)
 	if cfg.Strategy != "pause" {

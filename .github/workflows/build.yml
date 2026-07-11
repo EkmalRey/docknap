@@ -13,21 +13,21 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5
         with:
           go-version: '1.25'
           cache: true
       - run: go vet ./...
       - run: go test -race -count=1 ./...
       - name: Coverage
-        if: matrix.goos == 'linux' && github.event_name == 'push'
+        if: github.event_name == 'push'
         run: |
           go test -race -count=1 -coverprofile=coverage.txt -covermode=atomic ./...
           go tool cover -func=coverage.txt | tail -1
       - name: Upload coverage
         if: github.event_name == 'push'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: coverage
           path: coverage.txt
@@ -35,13 +35,62 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5
         with:
           go-version: '1.25'
           cache: true
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@4afd733a84b1f43292c63897423277bb7f4313a9
         with:
-          version: v1.62
+          version: v2.4.0
           args: --timeout=5m
+
+  govulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5
+        with:
+          go-version: '1.25'
+          cache: true
+      - run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+      - run: govulncheck ./...
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Run integration tests
+        run: tests/integration/run.sh
+
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5
+        with:
+          go-version: '1.25'
+          cache: true
+      - name: gofmt check
+        run: test -z "$(gofmt -l .)"
+      - name: go mod verify
+        run: go mod verify
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435
+      - name: Validate Compose files
+        run: docker compose -f docker-compose.example.yml config
+      - name: Build image for scan
+        run: docker build -t docknap:ci .
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
+        with:
+          image-ref: docknap:ci
+          format: table
+          exit-code: 1
+          severity: CRITICAL,HIGH
+          trivyignores: .trivyignore

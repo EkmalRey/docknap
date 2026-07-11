@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -23,7 +24,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("docker client: %v", err)
 	}
-	defer cli.Close()
+	defer func() { _ = cli.Close() }()
 
 	logFormat := strings.ToLower(envOr("DOCKNAP_LOG_FORMAT", "text"))
 	logger := NewLogger(os.Stderr, logFormat == "json")
@@ -36,14 +37,18 @@ func main() {
 
 	reg := NewRegistry()
 	s := newDocknap(cli, logger, reg)
-	s.networkName = envOr("DOCKNAP_NETWORK", "docknap_network")
-	s.listenAddr = envOr("DOCKNAP_LISTEN", ":8000")
-	s.idleDefault = parseDurationOr("DOCKNAP_IDLE_DEFAULT", 5*time.Minute)
-	s.startTimeoutDefault = parseDurationOr("DOCKNAP_START_TIMEOUT", 60*time.Second)
+	env, err := parseEnv()
+	if err != nil {
+		log.Fatal(err)
+	}
+	s.networkName = env.networkName
+	s.listenAddr = env.listenAddr
+	s.idleDefault = env.idleDefault
+	s.startTimeoutDefault = env.startTimeout
 	s.adminHost = os.Getenv("DOCKNAP_ADMIN_HOST")
-	s.tldCount = envOrInt("DOCKNAP_TLD_COUNT", 1)
-	s.writeTimeout = parseDurationOr("DOCKNAP_WRITE_TIMEOUT", 60*time.Second)
-	s.trustedProxies = parseTrustedProxies(os.Getenv("DOCKNAP_TRUSTED_PROXIES"))
+	s.tldCount = env.tldCount
+	s.writeTimeout = env.writeTimeout
+	s.trustedProxies = env.trustedProxies
 
 	if w := loadWebhookConfig(os.Getenv("DOCKNAP_WEBHOOK_URL"), os.Getenv("DOCKNAP_WEBHOOK_EVENTS")); w != nil {
 		s.notifier = w
@@ -83,7 +88,12 @@ func main() {
 	if err := s.discover(s.rootCtx); err != nil {
 		log.Fatalf("discover: %v", err)
 	}
-	s.m.Registered.Set(nil, float64(len(s.configs)))
+	s.mu.RLock()
+	configs := make(map[string]*Config, len(s.configs))
+	for sub, cfg := range s.configs {
+		configs[sub] = cfg
+	}
+	s.mu.RUnlock()
 
 	go s.sessionGC()
 	go s.watch(s.rootCtx)
@@ -110,8 +120,8 @@ func main() {
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/", s.handleProxy)
 
-	logger.Info("listening", F("addr", s.listenAddr), F("registered", len(s.configs)))
-	for sub, cfg := range s.configs {
+	logger.Info("listening", F("addr", s.listenAddr), F("registered", len(configs)))
+	for sub, cfg := range configs {
 		logger.Info("registered",
 			F("subdomain", sub),
 			F("container", cfg.Container),
@@ -121,7 +131,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              s.listenAddr,
-		Handler:           recoverMiddleware(mux),
+		Handler:           recoverMiddleware(securityHeaders(mux)),
 		ReadTimeout:       30 * time.Second,
 		ReadHeaderTimeout: 10 * time.Second,
 		WriteTimeout:      s.writeTimeout,
@@ -189,20 +199,49 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
-func envOrInt(key string, fallback int) int {
-	if v := os.Getenv(key); v != "" {
-		if i, err := strconv.Atoi(v); err == nil && i >= 1 {
-			return i
-		}
-	}
-	return fallback
+type environment struct {
+	networkName    string
+	listenAddr     string
+	idleDefault    time.Duration
+	startTimeout   time.Duration
+	writeTimeout   time.Duration
+	tldCount       int
+	trustedProxies []cidr
 }
 
-func parseDurationOr(key string, fallback time.Duration) time.Duration {
-	if v := os.Getenv(key); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			return d
+func parseEnv() (environment, error) {
+	e := environment{
+		networkName:  envOr("DOCKNAP_NETWORK", "docknap_network"),
+		listenAddr:   envOr("DOCKNAP_LISTEN", ":8000"),
+		idleDefault:  5 * time.Minute,
+		startTimeout: time.Minute,
+		writeTimeout: time.Minute,
+		tldCount:     1,
+	}
+	for key, dst := range map[string]*time.Duration{
+		"DOCKNAP_IDLE_DEFAULT":  &e.idleDefault,
+		"DOCKNAP_START_TIMEOUT": &e.startTimeout,
+		"DOCKNAP_WRITE_TIMEOUT": &e.writeTimeout,
+	} {
+		if value := os.Getenv(key); value != "" {
+			d, err := time.ParseDuration(value)
+			if err != nil || d < 0 || (d == 0 && key != "DOCKNAP_WRITE_TIMEOUT") {
+				return e, fmt.Errorf("%s must be a valid positive duration", key)
+			}
+			*dst = d
 		}
 	}
-	return fallback
+	if value := os.Getenv("DOCKNAP_TLD_COUNT"); value != "" {
+		n, err := strconv.Atoi(value)
+		if err != nil || n < 1 {
+			return e, fmt.Errorf("DOCKNAP_TLD_COUNT must be a positive integer")
+		}
+		e.tldCount = n
+	}
+	tp, err := parseTrustedProxies(os.Getenv("DOCKNAP_TRUSTED_PROXIES"))
+	if err != nil {
+		return e, err
+	}
+	e.trustedProxies = tp
+	return e, nil
 }

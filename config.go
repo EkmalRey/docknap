@@ -44,38 +44,64 @@ var themes = map[string]*Theme{
 const defaultBootMessages = "warming up the process...|loading dependencies...|binding sockets...|initializing runtime...|almost there..."
 
 func (s *Docknap) parseLabels(labels map[string]string) (*Config, bool) {
+	reject := func(reason string) (*Config, bool) {
+		if s.logger != nil {
+			s.logger.Warn("invalid docknap labels, skipping container",
+				F("container", labels["com.docker.compose.service"]),
+				F("reason", reason))
+		}
+		return nil, false
+	}
 	if labels["docknap.enable"] != "true" {
 		return nil, false
 	}
 	subdomain := labels["docknap.subdomain"]
 	if subdomain == "" {
-		return nil, false
+		return reject("docknap.subdomain is required")
 	}
 	portStr := labels["docknap.target_port"]
 	if portStr == "" {
-		return nil, false
+		return reject("docknap.target_port is required")
 	}
 	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		return nil, false
+	if err != nil || port < 1 || port > 65535 {
+		return reject("docknap.target_port must be an integer in 1..65535")
 	}
 	timeout := s.idleDefault
 	if t := labels["docknap.idle_timeout"]; t != "" {
-		if d, err := time.ParseDuration(t); err == nil {
-			timeout = d
+		d, err := time.ParseDuration(t)
+		if err != nil || d <= 0 {
+			return reject("docknap.idle_timeout must be a positive duration")
 		}
+		timeout = d
 	}
 	startupTimeout := s.startTimeoutDefault
 	if t := labels["docknap.startup_timeout"]; t != "" {
-		if d, err := time.ParseDuration(t); err == nil {
-			startupTimeout = d
+		d, err := time.ParseDuration(t)
+		if err != nil || d <= 0 {
+			return reject("docknap.startup_timeout must be a positive duration")
 		}
+		startupTimeout = d
+	}
+	strategy := parseStrategy(labels["docknap.strategy"])
+	if labels["docknap.strategy"] != "" && labels["docknap.strategy"] != "pause" && labels["docknap.strategy"] != "stop" {
+		return reject("docknap.strategy must be 'pause' or 'stop'")
+	}
+	for _, key := range []string{"docknap.show_logs", "docknap.show_stats", "docknap.live_logs", "docknap.disable_idle"} {
+		if value := labels[key]; value != "" && value != "true" && value != "false" {
+			return reject(key + " must be 'true' or 'false'")
+		}
+	}
+	if strategy == "pause" && labels["docknap.health_path"] == "" {
+		return reject("docknap.strategy=pause requires docknap.health_path")
 	}
 	showLogs := labels["docknap.show_logs"] != "false"
 	showStats := labels["docknap.show_stats"] != "false"
 	theme := labels["docknap.theme"]
 	if theme == "" {
 		theme = "green"
+	} else if _, ok := themes[theme]; !ok {
+		return reject("docknap.theme is unknown")
 	}
 	boot := defaultBootMessages
 	if b := labels["docknap.boot_messages"]; b != "" {
@@ -96,7 +122,7 @@ func (s *Docknap) parseLabels(labels map[string]string) (*Config, bool) {
 		HealthPath:     labels["docknap.health_path"],
 		BootMessages:   splitNonEmpty(boot, "|"),
 		DisableIdle:    labels["docknap.disable_idle"] == "true",
-		Strategy:       parseStrategy(labels["docknap.strategy"]),
+		Strategy:       strategy,
 	}, true
 }
 

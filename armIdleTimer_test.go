@@ -41,21 +41,25 @@ func TestArmIdleTimerIsIdempotent(t *testing.T) {
 
 	s.armIdleTimer(cfg)
 	s.mu.RLock()
-	first, ok := s.idleTimers[cfg.Container]
+	first := s.idleTimers[cfg.Container]
 	s.mu.RUnlock()
-	if !ok {
+	if first == nil {
 		t.Fatal("first arm should create timer")
 	}
-	if !first.Stop() {
-		t.Error("first timer should be pending and stop() should return true")
-	}
 
+	// Capture identity BEFORE second arm.
 	s.armIdleTimer(cfg)
 	s.mu.RLock()
-	second, ok := s.idleTimers[cfg.Container]
+	second := s.idleTimers[cfg.Container]
 	s.mu.RUnlock()
-	if !ok {
+	if second == nil {
 		t.Fatal("second arm should still leave a timer")
 	}
+
+	if first != second {
+		t.Errorf("idempotence violated: first=%p second=%p", first, second)
+	}
+
+	first.Stop()
 	second.Stop()
 }

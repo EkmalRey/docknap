@@ -24,6 +24,11 @@ func (r *loginRateLimiter) allow(key string) bool {
 	defer r.mu.Unlock()
 	now := time.Now()
 	cutoff := now.Add(-r.window)
+	for key, hits := range r.hits {
+		if len(hits) == 0 || !hits[len(hits)-1].After(cutoff) {
+			delete(r.hits, key)
+		}
+	}
 	hits := r.hits[key]
 	j := 0
 	for ; j < len(hits); j++ {

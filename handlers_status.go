@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -85,17 +86,17 @@ func (s *Docknap) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"docknap_version": version,
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(status)
+	_ = json.NewEncoder(w).Encode(status)
 }
 
 func (s *Docknap) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	s.refreshStateGauges(r.Context())
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	s.metrics.WriteTo(w)
+	_, _ = s.metrics.WriteTo(w)
 }
 
 func (s *Docknap) handleServiceMetrics(w http.ResponseWriter, r *http.Request) {
-	sub := trimPrefix(r.URL.Path, "/_docknap/metrics/")
+	sub := strings.TrimPrefix(r.URL.Path, "/_docknap/metrics/")
 	s.mu.RLock()
 	_, ok := s.configs[sub]
 	s.mu.RUnlock()
@@ -108,7 +109,7 @@ func (s *Docknap) handleServiceMetrics(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Docknap) handleServiceHistory(w http.ResponseWriter, r *http.Request) {
-	sub := trimPrefix(r.URL.Path, "/_docknap/history/")
+	sub := strings.TrimPrefix(r.URL.Path, "/_docknap/history/")
 	s.mu.RLock()
 	cfg, ok := s.configs[sub]
 	evs := append([]Event(nil), s.events[sub]...)
@@ -149,7 +150,7 @@ func (s *Docknap) handleServiceHistory(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(out)
+	_ = json.NewEncoder(w).Encode(out)
 }
 
 func startupStatsFor(s *Docknap, sub string) map[string]interface{} {
@@ -169,13 +170,6 @@ func startupStatsFor(s *Docknap, sub string) map[string]interface{} {
 		"sum_s":          sum,
 		"idle_timeout_s": cfg.IdleTimeout.Seconds(),
 	}
-}
-
-func trimPrefix(s, prefix string) string {
-	if len(s) >= len(prefix) && s[:len(prefix)] == prefix {
-		return s[len(prefix):]
-	}
-	return s
 }
 
 func (s *Docknap) handleConfig(w http.ResponseWriter, r *http.Request) {
@@ -204,7 +198,7 @@ func (s *Docknap) handleConfig(w http.ResponseWriter, r *http.Request) {
 		return snapshot[i]["subdomain"].(string) < snapshot[j]["subdomain"].(string)
 	})
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"services":        snapshot,
 		"registered":      len(snapshot),
 		"docknap_version": version,
@@ -212,8 +206,4 @@ func (s *Docknap) handleConfig(w http.ResponseWriter, r *http.Request) {
 		"network":         s.networkName,
 		"tld_count":       s.tldCount,
 	})
-}
-
-func renderTemplate(w http.ResponseWriter, name string, data interface{}) error {
-	return templates.ExecuteTemplate(w, name+".html", data)
 }
